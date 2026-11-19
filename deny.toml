@@ -1,0 +1,20 @@
+# Checks what consumers of the crate get: dev-dependencies (the executor examples) are not part of the published graph.
+[graph]
+all-features = true
+exclude-dev = true
+
+[advisories]
+ignore = []
+
+[licenses]
+# Permissive licenses only.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

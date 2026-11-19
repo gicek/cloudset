@@ -1,0 +1,32 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      multiple: true
+      options: [WebDAV, Nextcloud, Dropbox, OneDrive, Google Drive, Not provider-specific]
+    validations:
+      required: true
+  - type: textarea
+    id: exchange
+    attributes:
+      label: Requests and responses
+      description: >-
+        The status codes and the shape of the responses, if you have them. Remove tokens, passwords, cookies, query
+        strings and personal data first.
+  - type: input
+    id: version
+    attributes:
+      label: cloudset version
+    validations:
+      required: true

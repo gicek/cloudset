@@ -1,0 +1,70 @@
+[package]
+name = "cloudset"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Sans-IO cloud storage client for WebDAV, Nextcloud, Dropbox, OneDrive and Google Drive"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gicek/cloudset"
+documentation = "https://docs.rs/cloudset"
+readme = "README.md"
+keywords = ["webdav", "dropbox", "onedrive", "google-drive", "sans-io"]
+categories = ["network-programming", "api-bindings", "web-programming::http-client"]
+include = ["/src", "/tests", "/golden", "/examples", "/README.md", "/CHANGELOG.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# In-memory WebDAV, Dropbox, OneDrive and Google Drive servers for tests (`cloudset::testing`).
+testing = []
+
+[dependencies]
+base64 = "0.23.1"
+httpdate = "1.0.3"
+percent-encoding = "2.3.2"
+quick-xml = "0.42.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+url = "2.5.8"
+zeroize = "1.9.0"
+
+[dev-dependencies]
+cloudset = { path = ".", features = ["testing"] }
+# Only for the executor examples, which talk to a real server: `ureq_executor` (blocking) and `reqwest_executor` (async).
+ureq = { version = "3.5.1", default-features = false, features = ["rustls", "platform-verifier"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "webdav_memory"
+required-features = ["testing"]
+
+[[example]]
+name = "oauth_memory"
+required-features = ["testing"]
+
+[[example]]
+name = "custom_operation"
+required-features = ["testing"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+must_use_candidate = "warn"
+missing_errors_doc = "warn"

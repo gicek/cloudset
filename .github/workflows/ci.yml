@@ -1,0 +1,77 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    # Weekly, so new advisories and toolchain changes show up without a push.
+    - cron: "17 4 * * 1"
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  MSRV: "1.88"
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+        rust: [stable]
+        include:
+          - os: ubuntu-24.04
+            rust: msrv
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          toolchain=${{ matrix.rust == 'msrv' && env.MSRV || matrix.rust }}
+          rustup toolchain install "$toolchain" --profile minimal --component clippy
+          rustup default "$toolchain"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Clippy
+        if: matrix.rust == 'stable'
+        run: cargo clippy --all-targets --all-features --locked
+      - name: Tests
+        run: cargo test --all-features --locked
+      - name: Library without features
+        run: cargo build --locked
+
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Documentation (as on docs.rs)
+        run: cargo +nightly doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+      - name: Package contents
+        run: cargo package --locked --list
+      - name: Lowest allowed versions of direct dependencies
+        run: |
+          cargo +nightly update -Z direct-minimal-versions
+          cargo +stable test --all-features --lib --tests
+
+  dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
