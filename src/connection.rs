@@ -74,7 +74,9 @@ impl Endpoint {
     #[must_use]
     pub fn complete_address(input: &str) -> String {
         let text = input.trim();
-        if text.is_empty() || text.contains("://") {
+        // A scheme only counts in front of the address, not inside its path or query.
+        let has_scheme = text.find("://").is_some_and(|colon| text.find(['/', '?', '#']) == Some(colon + 1));
+        if text.is_empty() || has_scheme {
             return text.to_owned();
         }
         let authority = text.split(['/', '?', '#']).next().unwrap_or_default();
@@ -152,6 +154,11 @@ impl Endpoint {
             if is_dir {
                 segments.push("");
             }
+        }
+        // RFC 3986 does not allow these in a path, and strict servers answer 400 to them unencoded.
+        if url.path().contains(['[', ']', '|', '^']) {
+            let path = url.path().replace('[', "%5B").replace(']', "%5D").replace('|', "%7C").replace('^', "%5E");
+            url.set_path(&path);
         }
         Ok(url)
     }
@@ -258,6 +265,8 @@ pub(crate) struct OAuthCredential {
     pub provider: ProviderKind,
     pub access: AccessScope,
     pub client_id: String,
+    /// The client secret of a Google desktop client, needed again for every refresh. `None` for clients without one.
+    pub client_secret: Option<Zeroizing<String>>,
     pub access_token: Zeroizing<String>,
     pub refresh_token: Zeroizing<String>,
     pub expires_at: Option<SystemTime>,
@@ -314,6 +323,8 @@ struct Stored {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     access_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
@@ -333,7 +344,7 @@ struct Stored {
 impl Drop for Stored {
     /// Wipes the passwords and tokens in intermediate copies.
     fn drop(&mut self) {
-        for secret in [&mut self.password, &mut self.access_token, &mut self.refresh_token].into_iter().flatten() {
+        for secret in [&mut self.password, &mut self.client_secret, &mut self.access_token, &mut self.refresh_token].into_iter().flatten() {
             secret.zeroize();
         }
     }
@@ -511,6 +522,7 @@ impl Connection {
                     AccessScope::Full => "full".to_owned(),
                 });
                 stored.client_id = Some(credential.client_id.clone());
+                stored.client_secret = credential.client_secret.as_ref().map(|secret| secret.to_string());
                 stored.access_token = Some(credential.access_token.to_string());
                 stored.refresh_token = Some(credential.refresh_token.to_string());
                 stored.expires_at = credential.expires_at.and_then(|at| at.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs());
@@ -535,8 +547,11 @@ impl Connection {
         }
         let parse = |text: &str| Endpoint::parse(text, Transport::AllowInsecureHttp).map_err(|_| CloudError::InvalidConnection);
         let invalid = || CloudError::InvalidConnection;
-        let has_oauth_fields =
-            stored.access.is_some() || stored.client_id.is_some() || stored.access_token.is_some() || stored.refresh_token.is_some();
+        let has_oauth_fields = stored.access.is_some()
+            || stored.client_id.is_some()
+            || stored.client_secret.is_some()
+            || stored.access_token.is_some()
+            || stored.refresh_token.is_some();
         let kind = match stored.provider.as_str() {
             "webdav" | "nextcloud" => {
                 if has_oauth_fields || stored.account.is_some() || stored.expires_at.is_some() || stored.app_folder.is_some() {
@@ -593,9 +608,16 @@ impl Connection {
                     provider,
                     access,
                     client_id: stored.client_id.take().filter(|id| !id.is_empty()).ok_or_else(invalid)?,
+                    client_secret: match stored.client_secret.take() {
+                        Some(secret) if secret.is_empty() => return Err(invalid()),
+                        secret => secret.map(Zeroizing::new),
+                    },
                     access_token: Zeroizing::new(stored.access_token.take().ok_or_else(invalid)?),
                     refresh_token: Zeroizing::new(stored.refresh_token.take().filter(|token| !token.is_empty()).ok_or_else(invalid)?),
-                    expires_at: stored.expires_at.map(|secs| UNIX_EPOCH + Duration::from_secs(secs)),
+                    expires_at: stored
+                        .expires_at
+                        .map(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)).ok_or_else(invalid))
+                        .transpose()?,
                     account: stored.account.take().unwrap_or_default(),
                     folder_name,
                 })
@@ -630,6 +652,8 @@ mod tests {
         assert_eq!(Endpoint::complete_address("http://cloud.example.com"), "http://cloud.example.com");
         assert_eq!(Endpoint::complete_address("999.1.1.1"), "https://999.1.1.1", "an invalid IP is treated as a domain name");
         assert_eq!(Endpoint::complete_address("   "), "");
+        assert_eq!(Endpoint::complete_address("example.com/dav?next=http://x"), "https://example.com/dav?next=http://x");
+        assert_eq!(Endpoint::complete_address("192.168.1.10/a://b"), "http://192.168.1.10/a://b");
         assert!(
             Endpoint::parse(&Endpoint::complete_address("192.168.1.10"), Transport::RequireHttps).is_err(),
             "an IP gets plain HTTP, which must be confirmed first"
@@ -693,6 +717,7 @@ mod tests {
             provider: ProviderKind::OneDrive,
             access: AccessScope::AppFolder,
             client_id: "id".into(),
+            client_secret: None,
             access_token: Zeroizing::new("a".into()),
             refresh_token: Zeroizing::new("r".into()),
             expires_at: None,
@@ -728,6 +753,8 @@ mod tests {
         assert_eq!(endpoint.resolve(&path, false).unwrap().as_str(), "https://x.com/dav/%E5%A4%87%E4%BB%BD/a%20b%23%3F.txt");
         assert_eq!(endpoint.resolve(&RemotePath::parse("Backups").unwrap(), true).unwrap().as_str(), "https://x.com/dav/Backups/");
         assert_eq!(endpoint.resolve(&RemotePath::root(), true).unwrap().as_str(), "https://x.com/dav/");
+        let brackets = RemotePath::parse("report[1]|^.txt").unwrap();
+        assert_eq!(endpoint.resolve(&brackets, false).unwrap().as_str(), "https://x.com/dav/report%5B1%5D%7C%5E.txt");
     }
 
     #[test]
@@ -748,6 +775,7 @@ mod tests {
             provider: ProviderKind::Dropbox,
             access: AccessScope::Full,
             client_id: "app-key".into(),
+            client_secret: None,
             access_token: Zeroizing::new("sl.access-token".into()),
             refresh_token: Zeroizing::new("refresh-token".into()),
             expires_at: Some(UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
@@ -766,6 +794,7 @@ mod tests {
             provider: ProviderKind::GoogleDrive,
             access: AccessScope::AppFolder,
             client_id: "123-abc.apps.googleusercontent.com".into(),
+            client_secret: None,
             access_token: Zeroizing::new("ya29.token".into()),
             refresh_token: Zeroizing::new("1//refresh".into()),
             expires_at: None,

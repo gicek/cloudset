@@ -131,14 +131,34 @@ impl Client {
         }
     }
 
-    /// Writes a file and returns its metadata after the write. An unmet precondition reports
-    /// [`CloudError::PreconditionFailed`] and leaves the remote unchanged. A missing parent directory reports
-    /// [`CloudError::NotFound`] on WebDAV; Dropbox, OneDrive and Google Drive create it.
+    /// Whether this backend can enforce the requested condition for this payload.
+    /// The server can still reject a supported write due to a conflict or permissions.
+    #[must_use]
+    pub fn supports_write_precondition(&self, size: usize, precondition: &Precondition) -> bool {
+        match self.connection.provider() {
+            ProviderKind::GoogleDrive => matches!(precondition, Precondition::None),
+            ProviderKind::OneDrive => onedrive::supports_write_precondition(&self.config, size, precondition),
+            ProviderKind::WebDav | ProviderKind::Nextcloud => !matches!(precondition, Precondition::Matches(rev) if !rev.is_strong_etag()),
+            ProviderKind::Dropbox => true,
+        }
+    }
+
+    /// Writes a file. An unavailable guarantee returns [`CloudError::UnsupportedPrecondition`] before mutation.
+    /// A rejected condition returns [`CloudError::PreconditionFailed`]. If confirmation fails after submission,
+    /// reconcile the remote content before retrying. Use [`Self::supports_write_precondition`] for capability discovery.
+    /// A missing parent directory reports [`CloudError::NotFound`] on WebDAV; Dropbox, OneDrive and Google Drive create
+    /// it.
+    ///
+    /// On Google Drive, where names are not unique, a file created at the same moment as another device's reports
+    /// [`CloudError::CommitUnconfirmed`]; the path then resolves to the other device's file.
     ///
     /// On Dropbox, OneDrive and Google Drive, files larger than [`Limits::upload_chunk_bytes`] go up in pieces through an
     /// upload session, so their size is not bound by the providers' single-request limits. The whole file is kept in
     /// memory either way.
     pub fn write(&self, path: RemotePath, data: Vec<u8>, precondition: Precondition) -> BoxOperation<Entry> {
+        if path.is_root() {
+            return Box::new(Ready::err(CloudError::InvalidPath));
+        }
         match self.connection.provider() {
             ProviderKind::WebDav | ProviderKind::Nextcloud => dispatch(self.dav(), |dav| dav.write(path, data, precondition)),
             ProviderKind::Dropbox => dropbox::write(&self.connection, &self.config, path, data, precondition),
@@ -158,8 +178,11 @@ impl Client {
         }
     }
 
-    /// Deletes a file or directory; a missing one counts as success.
+    /// Deletes a file or directory; a missing one counts as success. Deleting the connection root returns `InvalidPath`.
     pub fn delete(&self, path: RemotePath) -> BoxOperation<()> {
+        if path.is_root() {
+            return Box::new(Ready::err(CloudError::InvalidPath));
+        }
         match self.connection.provider() {
             ProviderKind::WebDav | ProviderKind::Nextcloud => dispatch(self.dav(), |dav| dav.delete(path)),
             ProviderKind::Dropbox => dropbox::delete(&self.connection, &self.config, path),
@@ -174,7 +197,7 @@ impl Client {
     /// Fails with [`CloudError::PreconditionFailed`] when something already exists at `to`, [`CloudError::NotFound`]
     /// when `from` or the parent of `to` is missing, and [`CloudError::InvalidPath`] when either path is the root or
     /// `to` lies inside `from`. On Google Drive, where names are not unique, a concurrent create of the same name is
-    /// detected afterwards and the move is undone, whichever item is older.
+    /// checked afterwards. An ambiguous result reports [`CloudError::CommitUnconfirmed`] and leaves both items in place.
     pub fn rename(&self, from: RemotePath, to: RemotePath) -> BoxOperation<Entry> {
         if from.is_root() || to.is_root() || to.starts_with(&from) {
             return Box::new(Ready::err(CloudError::InvalidPath));

@@ -20,16 +20,24 @@ pub(crate) struct Outgoing {
     pub authorize: bool,
     /// Off for requests whose 3xx responses are not redirects (Google's 308 "Resume Incomplete").
     pub follow_redirects: bool,
+    /// Off for requests that have no use for a fresh token: a 401 goes to the provider as the answer.
+    pub refresh: bool,
 }
 
 impl Outgoing {
     pub(crate) fn authorized(request: HttpRequest) -> Self {
-        Self { request, authorize: true, follow_redirects: true }
+        Self { request, authorize: true, follow_redirects: true, refresh: true }
     }
 
     /// A request without credentials (a pre-signed URL, or a token in the body); the driver only allows HTTPS.
     pub(crate) fn anonymous(request: HttpRequest) -> Self {
-        Self { request, authorize: false, follow_redirects: true }
+        Self { request, authorize: false, follow_redirects: true, refresh: true }
+    }
+
+    /// Sends the token as it is: no refresh before the request, and a 401 is handed to the provider.
+    pub(crate) fn without_refresh(mut self) -> Self {
+        self.refresh = false;
+        self
     }
 
     /// Hands 3xx responses back to the provider instead of following them.
@@ -76,9 +84,13 @@ impl<S: Steps> Authorized<S> {
     }
 
     fn send(&mut self, outgoing: Outgoing, retried: bool) -> Result<Step<S::Output>, CloudError> {
-        if outgoing.authorize && !retried && oauth::needs_refresh(&self.credential, &self.config) {
+        if outgoing.authorize && outgoing.refresh && !retried && oauth::needs_refresh(&self.credential, &self.config) {
             return self.refresh(outgoing, false);
         }
+        self.send_after_refresh(outgoing, retried)
+    }
+
+    fn send_after_refresh(&mut self, outgoing: Outgoing, retried: bool) -> Result<Step<S::Output>, CloudError> {
         let mut request = outgoing.request.clone();
         if outgoing.authorize {
             if !providers::is_api_url(self.credential.provider, &request.url) {
@@ -89,7 +101,8 @@ impl<S: Steps> Authorized<S> {
             return Err(CloudError::InsecureRedirect);
         }
         request.headers.push(("User-Agent".into(), self.config.user_agent.clone()));
-        let mut call = Call::new(request.clone(), origin_of(&request.url)?, self.config.limits);
+        let origin = origin_of(&request.url)?;
+        let mut call = Call::new(request, origin, self.config.limits);
         if !outgoing.follow_redirects {
             call = call.without_redirects();
         }
@@ -100,7 +113,8 @@ impl<S: Steps> Authorized<S> {
 
     fn refresh(&mut self, pending: Outgoing, after_unauthorized: bool) -> Result<Step<S::Output>, CloudError> {
         let request = oauth::refresh_request(&self.credential, &self.config)?;
-        let mut call = Call::new(request.clone(), origin_of(&request.url)?, self.config.limits);
+        let origin = origin_of(&request.url)?;
+        let mut call = Call::new(request, origin, self.config.limits);
         let step = call.advance(None)?;
         self.phase = Phase::Refreshing { call, pending, after_unauthorized };
         sent(step)
@@ -117,6 +131,10 @@ fn sent<T>(step: CallStep) -> Result<Step<T>, CloudError> {
 impl<S: Steps> Operation for Authorized<S> {
     type Output = S::Output;
 
+    fn take_connection(&mut self) -> Option<Connection> {
+        std::mem::take(&mut self.refreshed).then(|| Connection::oauth(self.credential.clone()))
+    }
+
     fn advance(&mut self, response: Option<HttpResponse>) -> Result<Step<S::Output>, CloudError> {
         match std::mem::replace(&mut self.phase, Phase::Finished) {
             Phase::Start if response.is_none() => {
@@ -131,7 +149,7 @@ impl<S: Steps> Operation for Authorized<S> {
                 CallStep::Response(response) => {
                     oauth::apply_refresh(&mut self.credential, &response, &self.config)?;
                     self.refreshed = true;
-                    self.send(pending, after_unauthorized)
+                    self.send_after_refresh(pending, after_unauthorized)
                 }
             },
             Phase::Sending { mut call, outgoing, retried } => match call.advance(response)? {
@@ -139,7 +157,7 @@ impl<S: Steps> Operation for Authorized<S> {
                     self.phase = Phase::Sending { call, outgoing, retried };
                     Ok(Step::Send(request))
                 }
-                CallStep::Response(response) if response.status == 401 && outgoing.authorize => {
+                CallStep::Response(response) if response.status == 401 && outgoing.authorize && outgoing.refresh => {
                     if retried {
                         Err(CloudError::ReauthRequired)
                     } else {
@@ -148,9 +166,7 @@ impl<S: Steps> Operation for Authorized<S> {
                 }
                 CallStep::Response(response) => match self.steps.next(response)? {
                     Next::Request(next) => self.send(next, false),
-                    Next::Done(value) => {
-                        Ok(Step::Done(Done::new(value).with_connection(self.refreshed.then(|| Connection::oauth(self.credential.clone())))))
-                    }
+                    Next::Done(value) => Ok(Step::Done(Done::new(value).with_connection(self.take_connection()))),
                 },
             },
             Phase::Start | Phase::Finished => Err(CloudError::OutOfOrder),

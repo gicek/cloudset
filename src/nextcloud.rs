@@ -159,7 +159,12 @@ impl Operation for Poll {
                     404 => Ok(Step::Done(Done::new(None))),
                     200 => {
                         let credentials: Credentials = json(&response)?;
-                        same_origin(&self.server, &credentials.server)?;
+                        let server = same_origin(&self.server, &credentials.server)?;
+                        // The server names its HTTPS address: use it from here on, so the app password never
+                        // travels in the clear.
+                        if server.scheme() == "https" && !self.server.is_secure() {
+                            self.server = Endpoint::parse(server.as_str(), Transport::RequireHttps)?;
+                        }
                         let connection = Connection::nextcloud(
                             self.server.clone(),
                             self.server.clone(),
@@ -186,24 +191,31 @@ impl Operation for Poll {
                     _ => Err(status_error(&response)),
                 },
             },
-            PollState::User(mut call, credentials) => match call.advance(response)? {
-                CallStep::Send(request) => {
-                    self.state = PollState::User(call, credentials);
-                    Ok(Step::Send(request))
-                }
-                CallStep::Response(response) => {
-                    if response.status != 200 {
-                        return Err(status_error(&response));
+            PollState::User(mut call, credentials) => {
+                // The server hands the app password out once. Whatever goes wrong with the user ID lookup, the
+                // sign-in still has to end in a connection: fall back to the address that needs no user ID.
+                let user = match call.advance(response) {
+                    Ok(CallStep::Send(request)) => {
+                        self.state = PollState::User(call, credentials);
+                        return Ok(Step::Send(request));
                     }
-                    let ocs: Ocs = json(&response)?;
-                    let user = RemotePath::from_segments([ocs.ocs.data.id]).map_err(|_| CloudError::InvalidResponse("user id"))?;
-                    let files = Endpoint::parse(self.server.join("remote.php/dav/files/")?.as_str(), Transport::AllowInsecureHttp)?;
-                    let endpoint = Endpoint::parse(files.resolve(&user, true)?.as_str(), Transport::AllowInsecureHttp)?;
-                    let password = Zeroizing::new(credentials.app_password);
-                    let connection = Connection::nextcloud(self.server.clone(), endpoint, credentials.login_name, password.to_string());
-                    Ok(Step::Done(Done::new(Some(connection))))
-                }
-            },
+                    Ok(CallStep::Response(response)) if response.status == 200 => {
+                        json::<Ocs>(&response).ok().and_then(|ocs| RemotePath::from_segments([ocs.ocs.data.id]).ok())
+                    }
+                    _ => None,
+                };
+                let endpoint = match &user {
+                    Some(user) => {
+                        let files = Endpoint::parse(self.server.join("remote.php/dav/files/")?.as_str(), Transport::AllowInsecureHttp)?;
+                        files.resolve(user, true)?
+                    }
+                    None => self.server.join("remote.php/webdav/")?,
+                };
+                let endpoint = Endpoint::parse(endpoint.as_str(), Transport::AllowInsecureHttp)?;
+                let password = Zeroizing::new(credentials.app_password);
+                let connection = Connection::nextcloud(self.server.clone(), endpoint, credentials.login_name, password.to_string());
+                Ok(Step::Done(Done::new(Some(connection))))
+            }
             PollState::Finished => Err(CloudError::OutOfOrder),
         }
     }

@@ -103,3 +103,49 @@ fn reports_server_errors() {
         Some(CloudError::InvalidResponse(_))
     ));
 }
+
+const GRANTED: &str = r#"{"server":"https://cloud.example.com/nextcloud","loginName":"alice","appPassword":"app-password-1"}"#;
+
+/// The server hands the app password out once: a failed user ID lookup must not throw it away.
+#[test]
+fn a_failed_user_lookup_still_yields_a_connection() {
+    let flow = cloudset::run(begin_login(&server(), &config()).as_mut(), |_| json(200, START)).unwrap().value;
+    for lookup in [HttpResponse::new(503), json(200, "<html>"), HttpResponse::new(302).with_header("Location", "https://evil.example/")] {
+        let connection = cloudset::run(poll_login(&flow.poll, &config()).as_mut(), |request| {
+            if request.url.ends_with("/login/v2/poll") { json(200, GRANTED) } else { lookup.clone() }
+        })
+        .unwrap()
+        .value
+        .unwrap();
+        assert_eq!(connection.endpoint().unwrap().as_str(), "https://cloud.example.com/nextcloud/remote.php/webdav/");
+        assert_eq!(connection.account(), "alice");
+    }
+}
+
+/// A server reached over HTTP that names its HTTPS address gets the app password over HTTPS only.
+#[test]
+fn an_https_server_address_replaces_the_http_one() {
+    let entered = Endpoint::parse("http://cloud.example.com/nextcloud", Transport::AllowInsecureHttp).unwrap();
+    let flow = cloudset::run(begin_login(&entered, &config()).as_mut(), |_| json(200, START)).unwrap().value;
+    let mut authorized = Vec::new();
+    let connection = cloudset::run(poll_login(&flow.poll, &config()).as_mut(), |request| {
+        if request.url.ends_with("/login/v2/poll") {
+            return json(200, GRANTED);
+        }
+        authorized.push(request.url.clone());
+        json(200, r#"{"ocs":{"data":{"id":"alice"}}}"#)
+    })
+    .unwrap()
+    .value
+    .unwrap();
+    assert_eq!(authorized, ["https://cloud.example.com/nextcloud/ocs/v2.php/cloud/user?format=json"]);
+    assert!(connection.is_secure());
+    assert_eq!(connection.endpoint().unwrap().as_str(), "https://cloud.example.com/nextcloud/remote.php/dav/files/alice/");
+    assert_eq!(connection.server().unwrap().as_str(), "https://cloud.example.com/nextcloud/");
+
+    let app_link = START.replace("https://cloud.example.com/nextcloud/login/v2/flow/", "someapp://cloud.example.com:80/run/");
+    assert_eq!(
+        cloudset::run(begin_login(&entered, &config()).as_mut(), |_| json(200, &app_link)).err(),
+        Some(CloudError::InsecureRedirect)
+    );
+}

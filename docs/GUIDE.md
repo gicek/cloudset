@@ -15,11 +15,15 @@ use cloudset::{Operation, Step};
 let mut operation = client.read(path);
 let mut response = None;
 let file = loop {
-    match operation.advance(response.take())? {
+    let step = operation.advance(response.take());
+    if let Some(connection) = operation.take_connection() {
+        store(&connection)?;
+    }
+    match step? {
         Step::Send(request) => response = Some(send(request)?), // your HTTP stack
         Step::Done(done) => {
             if let Some(connection) = done.connection {
-                store(&connection); // a refreshed token: replace the stored copy
+                store(&connection)?; // a refreshed token: replace the stored copy
             }
             break done.value;
         }
@@ -35,7 +39,8 @@ let file = loop {
   blocks.
 - Dropping an operation cancels it; nothing needs cleaning up.
 - `cloudset::run(operation.as_mut(), |request| response)` is the same loop for a transport that cannot fail, such as the
-  in-memory test servers.
+  in-memory test servers. It returns a connection update only on success; `cloudset::run_with_updates` takes a
+  callback that receives each update as it happens, also when the operation fails afterwards.
 
 ## Connections
 
@@ -64,13 +69,14 @@ Store it in the system keychain or credential manager as is, never in a plain fi
 `Connection::from_bytes(&bytes)`; a blob from an unknown version reports `CloudError::InvalidConnection`, and the user
 should sign in again.
 
-Whenever `Done.connection` is `Some`, write the new blob back. Providers may rotate the refresh token, so an old blob can
-stop working.
+Persist updates from `take_connection()` before the next network request and use the new connection for subsequent
+operations. Persist any outstanding update in `Done.connection`. Serialize refreshes for operations sharing rotating
+credentials. Providers may rotate the refresh token, so an old blob can stop working.
 
 ## Signing in with OAuth
 
-Dropbox, OneDrive and Google Drive use the authorization code flow with PKCE. You register a public client (no client
-secret) with each provider and get a client ID and a redirect URI.
+Dropbox, OneDrive and Google Drive use the authorization code flow with PKCE. You register a public client with each
+provider and get a client ID and a redirect URI.
 
 ```rust
 use cloudset::{oauth, AccessScope, OAuthClient, ProviderKind};
@@ -93,6 +99,44 @@ if authorization.accepts(&callback_url) {
 - `complete` checks the callback URL and `state` before it sends anything. A forged or stale callback reports
   `CloudError::StateMismatch`; a canceled or denied sign-in reports `CloudError::AuthorizationDenied`.
 - `connection.account()` returns the account email (or name) to show the user.
+
+### Redirects and client types
+
+The callback reaches the app in one of two ways, and `OAuthClient::redirect_uri` is the exact URL either way:
+
+- **A custom scheme** the app registers with the system, such as `com.example.app.oauth://callback`. On Google this
+  needs an iOS client, whose scheme is the reversed client ID (`com.googleusercontent.apps.<id>:/oauth2redirect`).
+- **A loopback address**: listen on a free port of `127.0.0.1` for the duration of the sign-in and pass
+  `http://127.0.0.1:<port>/`. The callback must arrive on that host, port and path. This is what Google expects of
+  Windows, Linux and macOS apps, with a "Desktop app" client.
+
+```rust
+// Google "Desktop app" client: its token endpoint refuses requests without the client secret.
+let client = OAuthClient::new(client_id, format!("http://127.0.0.1:{port}/"))
+    .with_client_secret(client_secret)
+    .with_folder_name("Example App");
+```
+
+Google issues that secret to desktop clients although it ships inside the app; PKCE is what protects the sign-in. It
+goes into the token requests only, never into the browser, and is stored in the connection because refreshing needs
+it. `Debug` output leaves it out. Clients registered without a secret (Google iOS clients, Microsoft "Mobile and
+desktop applications", Dropbox with PKCE) need none.
+
+| Provider | Loopback redirect to register |
+| --- | --- |
+| Google Drive | Nothing: a "Desktop app" client accepts `http://127.0.0.1:<any port>` |
+| OneDrive | `http://localhost` once; the port is ignored when matching, so pass `http://localhost:<port>/` |
+| Dropbox | The exact URL including the port, so the app needs a fixed port |
+
+On Android, Google does not accept custom schemes for clients of the "Android" type, nor loopback redirects on
+mobile. What it documents instead is its own SDK, which is outside this crate. The redirect of an iOS client
+(`com.googleusercontent.apps.<id>:/oauth2redirect`) is tied to the client, not to the platform that opens the
+browser, so one iOS client can serve every platform: an Android app registers that scheme for its redirect activity
+and opens the sign-in page in a Custom Tab. This works on Android devices and from a macOS app (checked in November
+2026), but Google does not document it and may start checking the platform. An HTTPS App Link redirect is the
+fallback.
+
+A sign-in without a browser redirect (the device flow of TVs and command-line tools) is not supported.
 - On Dropbox, the access scope is a property of the app: register one app per scope and pass the matching client ID. On
   OneDrive and Google Drive, the same client ID requests different scopes.
 - Dropbox can also sign in through its official app; see `Authorization::dropbox_app_request` (Android) and
@@ -101,8 +145,8 @@ if authorization.accepts(&callback_url) {
 ### Access scopes
 
 `ProviderKind::access_scopes()` lists the supported scopes in order of preference. Default to the first. With
-`AccessScope::AppFolder`, every path is relative to the app's own folder, and a leaked token reaches nothing else. With
-`AccessScope::Full`, paths are relative to the drive root; let the user pick a folder.
+`AccessScope::AppFolder`, every Cloudset path is relative to the app folder. Google grants access per app-authorized
+file. With `AccessScope::Full`, paths are relative to the drive root; let the user pick a folder.
 
 ## Signing in to Nextcloud
 
@@ -134,7 +178,7 @@ the app password when the user disconnects.
 | `read(path)` | `Option<File>` | Data and the metadata of the same version |
 | `write(path, data, precondition)` | `Entry` | Metadata after the write |
 | `create_dir(path)` | `()` | An existing directory counts as success |
-| `rename(from, to)` | `Entry` | Moves or renames; never overwrites |
+| `rename(from, to)` | `Entry` | Moves or renames; see provider-specific conflict handling |
 | `delete(path)` | `()` | A missing item counts as success |
 | `revoke()` | `()` | Best effort; see the README for each provider |
 
@@ -151,16 +195,36 @@ file:
    or `Precondition::None` to overwrite unconditionally.
 3. On `CloudError::PreconditionFailed`, someone else wrote first. Read again, merge, and retry with the new revision.
 
-A failed precondition leaves the remote unchanged. The README explains how each provider enforces it, including the
-emulation on Google Drive.
+Check `client.supports_write_precondition(data.len(), &condition)` before offering conditional sync.
+`UnsupportedPrecondition` leaves the file untouched. Let users resolve the conflict explicitly.
+For `CommitUnconfirmed` or a transport failure during mutation, read the file again and compare its contents to
+the intended bytes before advancing your sync baseline. Only persist a revision bound to those bytes.
+A missing revision permits a read but cannot authorize a conditional replacement.
+
+#### Without conditional writes
+
+Google Drive, a WebDAV server with weak ETags and OneDrive uploads that need a session cannot enforce `Matches`.
+`Precondition::None` still works there, with a window in which another device's write can be overwritten. Narrow it
+like this:
+
+1. Keep the revision of the last version you synced.
+2. Right before writing, `stat` the file. A different revision means another device wrote: read, merge, and start over.
+3. Write with `Precondition::None`, then read the file back. If the content is not what you sent, another device
+   wrote after you: merge again.
+
+A write between steps 2 and 3 is still lost on the remote, so keep what your users cannot afford to lose recoverable
+on the device, such as the last synced copy, until a later sync confirms it. Where that is not good enough, ask the
+user before overwriting instead of syncing automatically.
 
 ### Moving and renaming
 
-`client.rename(from, to)` moves a file or directory, and returns the entry at its new path. It never overwrites:
+`client.rename(from, to)` moves a file or directory, and returns the entry at its new path. Check the result before
+recording the new location:
 
 - `PreconditionFailed`: something already exists at `to`;
 - `NotFound`: `from` or the parent directory of `to` is missing;
 - `InvalidPath`: either path is the root, or `to` lies inside `from`.
+- `CommitUnconfirmed`: inspect both paths before a retry.
 
 To replace a file atomically, write the new content with `Precondition::Matches` instead.
 
@@ -171,11 +235,10 @@ Files are read and written as whole `Vec<u8>` values, so they must fit in memory
 - **Reads** are capped by `Limits::max_body_bytes`, 16 MiB by default; a larger file fails with `TooLarge`. Raise the
   limit for larger files, and make your executor read up to the same limit.
 - **Writes** have no cap. On Dropbox, OneDrive and Google Drive, a file larger than `Limits::upload_chunk_bytes` (10 MiB
-  by default) goes up through an upload session, one request per chunk. Each chunk is a separate `Step::Send`, so you
-  can report progress by adding up the request bodies. The file appears only when the last chunk is in, and the
-  precondition is checked then, except on OneDrive, which checks `Matches` when the session opens (see
-  [Provider notes](PROVIDERS.md#onedrive)).
-- If a chunk fails in your executor, run the write again; the abandoned session expires on the provider's side.
+  by default, capped at 5 MiB for Google single requests) uses an upload session.
+  OneDrive rejects `Matches` when the payload requires a session.
+- Keep the backup size within the restore limit in both the crate and executor.
+  If the final response is lost, reconcile the remote file before retrying.
 
 ```rust
 let config = ClientConfig::new("MyApp/1.0")
@@ -196,6 +259,8 @@ error type. A typical mapping for a user interface:
 | `ReauthRequired` | Sign in again |
 | `Forbidden`, `NotFound` | Check the folder and permissions |
 | `PreconditionFailed` | Re-read and retry; another device wrote first |
+| `UnsupportedPrecondition` | This provider cannot safely perform the requested automatic write |
+| `CommitUnconfirmed` | Read again and compare the content before updating sync state |
 | `QuotaExceeded` | The storage is full |
 | `RateLimited { retry_after }` | Retry after the given delay, or back off |
 | `InsecureEndpoint` | Ask whether to allow plain HTTP |

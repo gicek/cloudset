@@ -440,6 +440,10 @@
       "responses": [
         {
           "status": 200,
+          "body": "{\"files\":[],\"nextPageToken\":\"continue\"}"
+        },
+        {
+          "status": 200,
           "body": "{\"kind\":\"drive#fileList\",\"incompleteSearch\":false,\"files\":[{\"kind\":\"drive#file\",\"id\":\"1AppFolderXyZ\",\"name\":\"cloudset-test\",\"mimeType\":\"application/vnd.google-apps.folder\",\"createdTime\":\"2026-09-30T10:00:00.000Z\",\"modifiedTime\":\"2026-09-30T10:00:00.000Z\"}]}"
         },
         {
@@ -643,7 +647,7 @@
       "provider": "googledrive",
       "operation": "write",
       "path": "Backups/data.bin",
-      "precondition": "absent",
+      "precondition": "none",
       "responses": [
         {
           "status": 200,
@@ -682,32 +686,17 @@
       "operation": "write",
       "path": "Backups/data.bin",
       "precondition": "absent",
-      "responses": [
-        {
-          "status": 200,
-          "body": "{\"kind\":\"drive#fileList\",\"incompleteSearch\":false,\"files\":[{\"kind\":\"drive#file\",\"id\":\"1AppFolderXyZ\",\"name\":\"cloudset-test\",\"mimeType\":\"application/vnd.google-apps.folder\",\"createdTime\":\"2026-09-30T10:00:00.000Z\",\"modifiedTime\":\"2026-09-30T10:00:00.000Z\"}]}"
-        },
-        {
-          "status": 200,
-          "body": "{\"kind\":\"drive#fileList\",\"incompleteSearch\":false,\"files\":[{\"kind\":\"drive#file\",\"id\":\"1BackupsFolderAbC\",\"name\":\"Backups\",\"mimeType\":\"application/vnd.google-apps.folder\",\"createdTime\":\"2026-10-01T08:00:00.000Z\",\"modifiedTime\":\"2026-10-01T08:00:00.000Z\"}]}"
-        },
-        {
-          "status": 200,
-          "body": "{\"kind\":\"drive#fileList\",\"incompleteSearch\":false,\"files\":[{\"kind\":\"drive#file\",\"id\":\"1DataBinFileDeF\",\"name\":\"data.bin\",\"mimeType\":\"application/octet-stream\",\"size\":\"2741\",\"createdTime\":\"2026-10-27T21:03:11.415Z\",\"modifiedTime\":\"2026-10-28T09:12:40.123Z\",\"headRevisionId\":\"0B4dataRevAAA\"}]}"
-        }
-      ],
+      "responses": [],
       "expected": {
-        "error": "PreconditionFailed"
+        "error": "UnsupportedPrecondition"
       }
     },
     {
-      "name": "googledrive-update-matches",
+      "name": "googledrive-update-file",
       "provider": "googledrive",
       "operation": "write",
       "path": "Backups/data.bin",
-      "precondition": {
-        "matches": "0B4dataRevAAA"
-      },
+      "precondition": "none",
       "responses": [
         {
           "status": 200,
@@ -724,10 +713,6 @@
         {
           "status": 200,
           "body": "{\"kind\":\"drive#file\",\"id\":\"1DataBinFileDeF\",\"name\":\"data.bin\",\"mimeType\":\"application/octet-stream\",\"size\":\"2741\",\"createdTime\":\"2026-10-27T21:03:11.415Z\",\"modifiedTime\":\"2026-10-28T09:12:40.123Z\",\"headRevisionId\":\"0B4dataRevBBB\"}"
-        },
-        {
-          "status": 200,
-          "body": "{\"revisions\":[{\"id\":\"0B4dataRev000\"},{\"id\":\"0B4dataRevAAA\"},{\"id\":\"0B4dataRevBBB\"}]}"
         }
       ],
       "expected": {
@@ -748,22 +733,9 @@
       "precondition": {
         "matches": "0B4dataRev000"
       },
-      "responses": [
-        {
-          "status": 200,
-          "body": "{\"kind\":\"drive#fileList\",\"incompleteSearch\":false,\"files\":[{\"kind\":\"drive#file\",\"id\":\"1AppFolderXyZ\",\"name\":\"cloudset-test\",\"mimeType\":\"application/vnd.google-apps.folder\",\"createdTime\":\"2026-09-30T10:00:00.000Z\",\"modifiedTime\":\"2026-09-30T10:00:00.000Z\"}]}"
-        },
-        {
-          "status": 200,
-          "body": "{\"kind\":\"drive#fileList\",\"incompleteSearch\":false,\"files\":[{\"kind\":\"drive#file\",\"id\":\"1BackupsFolderAbC\",\"name\":\"Backups\",\"mimeType\":\"application/vnd.google-apps.folder\",\"createdTime\":\"2026-10-01T08:00:00.000Z\",\"modifiedTime\":\"2026-10-01T08:00:00.000Z\"}]}"
-        },
-        {
-          "status": 200,
-          "body": "{\"kind\":\"drive#fileList\",\"incompleteSearch\":false,\"files\":[{\"kind\":\"drive#file\",\"id\":\"1DataBinFileDeF\",\"name\":\"data.bin\",\"mimeType\":\"application/octet-stream\",\"size\":\"2741\",\"createdTime\":\"2026-10-27T21:03:11.415Z\",\"modifiedTime\":\"2026-10-28T09:12:40.123Z\",\"headRevisionId\":\"0B4dataRevAAA\"}]}"
-        }
-      ],
+      "responses": [],
       "expected": {
-        "error": "PreconditionFailed"
+        "error": "UnsupportedPrecondition"
       }
     },
     {

@@ -11,8 +11,9 @@
 //!    [`Authorization::complete_dropbox_app`]): the same verifier, with the authorization code returned by the app via
 //!    an intent and `state` in the app protocol's format.
 //!
-//! No client secret is built in: the authorization code can only be redeemed with the verifier, so an app that hijacks
-//! the callback URL still cannot get tokens. Every [`Client`](crate::Client) operation refreshes
+//! The clients are public: the authorization code can only be redeemed with the verifier, so an app that hijacks
+//! the callback URL still cannot get tokens. Google's "Desktop app" clients come with a client secret all the same,
+//! which its token endpoint requires ([`OAuthClient::with_client_secret`]); it ships inside the app and is no secret. Every [`Client`](crate::Client) operation refreshes
 //! the token automatically when it expires or a 401 comes back.
 
 use std::fmt;
@@ -31,14 +32,20 @@ use crate::error::CloudError;
 use crate::http::{HttpRequest, HttpResponse, Method, Origin, status_error};
 use crate::operation::{BoxOperation, Call, CallStep, Done, Operation, Step};
 
-/// The caller's OAuth app configuration (public client, no secret).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The caller's OAuth app configuration: a public client, with the client secret Google issues to desktop apps when
+/// there is one.
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OAuthClient {
     /// The client ID (Dropbox: the app key) from the provider's developer console.
     pub client_id: String,
-    /// Callback URL registered in the provider's console, such as `com.example.app.oauth://callback`.
+    /// Callback URL: a custom scheme registered in the provider's console, such as `com.example.app.oauth://callback`,
+    /// or the loopback address the app listens on for this sign-in, such as `http://127.0.0.1:49152/`.
     pub redirect_uri: String,
+    /// The client secret of a Google "Desktop app" client, which Google expects with every token request although
+    /// it ships inside the app and protects nothing (PKCE does that). `None` for every client type registered
+    /// without one: Google's iOS clients, Microsoft public clients and Dropbox with PKCE.
+    pub client_secret: Option<Zeroizing<String>>,
     /// Name of the app folder on providers that have none of their own: Google Drive with [`AccessScope::AppFolder`]
     /// uses a visible folder with this name in the drive root, created on first access. Required there (otherwise
     /// [`begin`] reports [`CloudError::InvalidConnection`]); ignored by every other provider and scope, whose app folder
@@ -50,7 +57,15 @@ impl OAuthClient {
     /// A client without an app folder name.
     #[must_use]
     pub fn new(client_id: impl Into<String>, redirect_uri: impl Into<String>) -> Self {
-        Self { client_id: client_id.into(), redirect_uri: redirect_uri.into(), folder_name: None }
+        Self { client_id: client_id.into(), redirect_uri: redirect_uri.into(), client_secret: None, folder_name: None }
+    }
+
+    /// Sets [`OAuthClient::client_secret`]. It is sent in the body of token requests and stored with the connection,
+    /// because refreshing needs it too.
+    #[must_use]
+    pub fn with_client_secret(mut self, secret: impl Into<String>) -> Self {
+        self.client_secret = Some(Zeroizing::new(secret.into()));
+        self
     }
 
     /// Sets [`OAuthClient::folder_name`].
@@ -64,6 +79,17 @@ impl OAuthClient {
     #[must_use]
     pub fn callback_scheme(&self) -> String {
         Url::parse(&self.redirect_uri).map(|url| url.scheme().to_owned()).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for OAuthClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthClient")
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| "<redacted>"))
+            .field("folder_name", &self.folder_name)
+            .finish()
     }
 }
 
@@ -393,6 +419,10 @@ impl Authorization {
         if let Some(redirect_uri) = redirect_uri {
             form.push(("redirect_uri", redirect_uri.to_owned()));
         }
+        // In the body, next to the client ID, as Google's own clients send it.
+        if let Some(secret) = &self.client.client_secret {
+            form.push(("client_secret", secret.to_string()));
+        }
         if let Some(scope) = token_scope(self.provider, self.access) {
             form.push(("scope", scope.to_owned()));
         }
@@ -405,6 +435,7 @@ impl Authorization {
             provider: self.provider,
             access: self.access,
             client_id: self.client.client_id.clone(),
+            client_secret: self.client.client_secret.clone(),
             folder_name,
             config: config.clone(),
             state: ExchangeState::Token(call),
@@ -414,7 +445,11 @@ impl Authorization {
     fn code_from(&self, callback_url: &str) -> Result<Zeroizing<String>, CloudError> {
         let callback = Url::parse(callback_url).map_err(|_| CloudError::InvalidResponse("callback url"))?;
         let registered = Url::parse(&self.client.redirect_uri).map_err(|_| CloudError::InvalidResponse("redirect uri"))?;
-        if callback.scheme() != registered.scheme() || callback.host_str() != registered.host_str() || path(&callback) != path(&registered)
+        // The port too: on a loopback redirect it is the one this sign-in listens on.
+        if callback.scheme() != registered.scheme()
+            || callback.host_str() != registered.host_str()
+            || callback.port_or_known_default() != registered.port_or_known_default()
+            || path(&callback) != path(&registered)
         {
             return Err(CloudError::InvalidResponse("callback url"));
         }
@@ -484,14 +519,27 @@ struct TokenResponse {
 fn parse_token(response: &HttpResponse) -> Result<TokenResponse, CloudError> {
     match response.status {
         200 => serde_json::from_slice(&response.body).map_err(|_| CloudError::InvalidResponse("token json")),
+        // The server asks to try again later (RFC 6749 §4.1.2.1 names these two); the grant itself is still good.
+        400 | 401 if matches!(token_error(response).as_deref(), Some("temporarily_unavailable")) => {
+            Err(CloudError::RateLimited { retry_after: crate::http::retry_after(response) })
+        }
+        400 | 401 if matches!(token_error(response).as_deref(), Some("server_error")) => {
+            Err(CloudError::Server { status: response.status })
+        }
         // invalid_grant (refresh token revoked or expired), invalid_client, etc.: the only way out is signing in again.
         400 | 401 => Err(CloudError::ReauthRequired),
         _ => Err(status_error(response)),
     }
 }
 
+/// The `error` code of a token endpoint error response.
+fn token_error(response: &HttpResponse) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(&response.body).ok()?;
+    json.get("error")?.as_str().map(str::to_owned)
+}
+
 fn expires_at(expires_in: Option<u64>, config: &ClientConfig) -> Option<SystemTime> {
-    Some(config.now? + Duration::from_secs(expires_in?))
+    config.now?.checked_add(Duration::from_secs(expires_in?))
 }
 
 /// Request that exchanges the refresh token for a new access token.
@@ -502,6 +550,9 @@ pub(crate) fn refresh_request(credential: &OAuthCredential, config: &ClientConfi
         ("refresh_token", credential.refresh_token.to_string()),
         ("client_id", credential.client_id.clone()),
     ];
+    if let Some(secret) = &credential.client_secret {
+        form.push(("client_secret", secret.to_string()));
+    }
     if let Some(scope) = token_scope(credential.provider, credential.access) {
         form.push(("scope", scope.to_owned()));
     }
@@ -524,7 +575,7 @@ pub(crate) fn apply_refresh(credential: &mut OAuthCredential, response: &HttpRes
 /// reached. Without a known time, refresh only after a 401.
 pub(crate) fn needs_refresh(credential: &OAuthCredential, config: &ClientConfig) -> bool {
     match (config.now, credential.expires_at) {
-        (Some(now), Some(expires_at)) => now + EXPIRY_MARGIN >= expires_at,
+        (Some(now), Some(expires_at)) => expires_at.duration_since(now).unwrap_or_default() <= EXPIRY_MARGIN,
         _ => false,
     }
 }
@@ -540,6 +591,7 @@ struct Exchange {
     provider: ProviderKind,
     access: AccessScope,
     client_id: String,
+    client_secret: Option<Zeroizing<String>>,
     folder_name: Option<String>,
     config: ClientConfig,
     state: ExchangeState,
@@ -566,6 +618,7 @@ impl Operation for Exchange {
                         provider: self.provider,
                         access: self.access,
                         client_id: self.client_id.clone(),
+                        client_secret: self.client_secret.take(),
                         access_token: Zeroizing::new(token.access_token),
                         refresh_token: Zeroizing::new(refresh_token),
                         expires_at: expires_at(token.expires_in, &self.config),
@@ -922,6 +975,13 @@ mod tests {
             body: br#"{"error":"invalid_grant"}"#.to_vec(),
         });
         assert_eq!(result.err(), Some(CloudError::ReauthRequired));
+
+        // A server that asks to come back later has not revoked anything.
+        let busy = |error: &str| HttpResponse::new(400).with_body(format!(r#"{{"error":"{error}"}}"#).into_bytes());
+        assert_eq!(parse_token(&busy("temporarily_unavailable")).err(), Some(CloudError::RateLimited { retry_after: None }));
+        assert_eq!(parse_token(&busy("server_error")).err(), Some(CloudError::Server { status: 400 }));
+        assert_eq!(parse_token(&busy("invalid_client")).err(), Some(CloudError::ReauthRequired));
+        assert_eq!(parse_token(&HttpResponse::new(400)).err(), Some(CloudError::ReauthRequired));
     }
 
     #[test]
@@ -930,6 +990,7 @@ mod tests {
             provider: ProviderKind::OneDrive,
             access: AccessScope::AppFolder,
             client_id: "id".into(),
+            client_secret: None,
             access_token: Zeroizing::new("old".into()),
             refresh_token: Zeroizing::new("r1".into()),
             expires_at: Some(UNIX_EPOCH + Duration::from_secs(100)),

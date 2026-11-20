@@ -69,11 +69,17 @@ fn error_for(response: &HttpResponse) -> CloudError {
         return status_error(response);
     }
     let summary = error_summary(response);
-    if summary.contains("not_found") {
+    if summary.contains("too_many_write_operations") {
+        // Concurrent writes to the same namespace: "please retry this request".
+        CloudError::RateLimited { retry_after: None }
+    } else if summary.contains("not_found") || summary.contains("not_folder") {
         CloudError::NotFound
+    } else if summary.contains("conflict/file_ancestor") {
+        // A file sits where a parent folder is needed: nothing a re-read and retry would change.
+        CloudError::Forbidden
     } else if summary.contains("conflict") {
         CloudError::PreconditionFailed
-    } else if summary.contains("insufficient_space") {
+    } else if summary.contains("insufficient_space") || summary.contains("insufficient_quota") {
         CloudError::QuotaExceeded
     } else if ["malformed_path", "disallowed_name", "cant_move_folder_into_itself", "duplicated_or_nested_paths"]
         .iter()
@@ -310,6 +316,14 @@ fn session_error(response: &HttpResponse) -> CloudError {
     error_for(response)
 }
 
+impl Write {
+    /// A folder at the path is "something exists" for [`Precondition::Absent`]; for any other write it is in the way.
+    fn write_error(&self, response: &HttpResponse) -> CloudError {
+        let in_the_way = response.status == 409 && error_summary(response).contains("conflict/folder");
+        if in_the_way && !matches!(self.precondition, Precondition::Absent) { CloudError::Forbidden } else { session_error(response) }
+    }
+}
+
 impl Steps for Write {
     type Output = Entry;
 
@@ -329,8 +343,11 @@ impl Steps for Write {
     fn next(&mut self, response: HttpResponse) -> Result<Next<Entry>, CloudError> {
         match std::mem::replace(&mut self.state, WriteState::Start) {
             WriteState::Committing => match response.status {
-                200 => Ok(Next::Done(file_entry(&json_body(&response)?, self.path.clone())?)),
-                _ => Err(session_error(&response)),
+                200 => json_body(&response)
+                    .and_then(|item| file_entry(&item, self.path.clone()))
+                    .map(Next::Done)
+                    .map_err(|_| CloudError::CommitUnconfirmed),
+                _ => Err(self.write_error(&response)),
             },
             WriteState::Starting => match response.status {
                 200 => {
@@ -338,11 +355,11 @@ impl Steps for Write {
                     let session = json.get("session_id").and_then(Value::as_str).ok_or(CloudError::InvalidResponse("session id"))?;
                     Ok(Next::Request(self.continue_session(session.to_owned())))
                 }
-                _ => Err(session_error(&response)),
+                _ => Err(self.write_error(&response)),
             },
             WriteState::Appending { session } => match response.status {
                 200 => Ok(Next::Request(self.continue_session(session))),
-                _ => Err(session_error(&response)),
+                _ => Err(self.write_error(&response)),
             },
             WriteState::Start => Err(CloudError::OutOfOrder),
         }
@@ -486,7 +503,8 @@ impl Steps for Revoke {
     type Output = ();
 
     fn first(&mut self) -> Result<Outgoing, CloudError> {
-        Ok(rpc("auth/token/revoke", &Value::Null))
+        // A token Dropbox no longer accepts is already revoked: refreshing it first would turn that into an error.
+        Ok(rpc("auth/token/revoke", &Value::Null).without_refresh())
     }
 
     fn next(&mut self, response: HttpResponse) -> Result<Next<()>, CloudError> {
@@ -524,5 +542,11 @@ mod tests {
         assert_eq!(error_for(&response("path/insufficient_space/")), CloudError::QuotaExceeded);
         assert_eq!(error_for(&response("path/malformed_path/")), CloudError::InvalidPath);
         assert_eq!(error_for(&response("other/")), CloudError::Server { status: 409 });
+        assert_eq!(error_for(&response("path/too_many_write_operations/..")), CloudError::RateLimited { retry_after: None });
+        assert_eq!(error_for(&response("too_many_write_operations/.")), CloudError::RateLimited { retry_after: None });
+        assert_eq!(error_for(&response("to/insufficient_quota/.")), CloudError::QuotaExceeded);
+        assert_eq!(error_for(&response("path/not_folder/.")), CloudError::NotFound);
+        assert_eq!(error_for(&response("path/conflict/file_ancestor/.")), CloudError::Forbidden);
+        assert_eq!(error_for(&response("to/conflict/folder/.")), CloudError::PreconditionFailed);
     }
 }

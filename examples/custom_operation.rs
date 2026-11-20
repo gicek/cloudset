@@ -76,6 +76,12 @@ impl WriteCreatingDir {
 impl Operation for WriteCreatingDir {
     type Output = Entry;
 
+    fn take_connection(&mut self) -> Option<Connection> {
+        let updated = self.connection.take()?;
+        self.client = self.client.with_connection(updated.clone());
+        Some(updated)
+    }
+
     fn advance(&mut self, response: Option<HttpResponse>) -> Result<Step<Entry>, CloudError> {
         match (&self.stage, response) {
             (Stage::Writing { .. }, None) if self.write.is_none() => self.start_write(),

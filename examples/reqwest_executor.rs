@@ -35,7 +35,7 @@ impl Executor {
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
-        let mut response = builder.send().await?;
+        let mut response = builder.send().await.map_err(reqwest::Error::without_url)?;
         let status = response.status().as_u16();
         let headers: Vec<(String, String)> = response
             .headers()
@@ -43,8 +43,9 @@ impl Executor {
             .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str().to_owned(), value.to_owned())))
             .collect();
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            body.extend_from_slice(&chunk);
+        while let Some(chunk) = response.chunk().await.map_err(reqwest::Error::without_url)? {
+            let remaining = self.max_body.saturating_add(1).saturating_sub(body.len());
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
             if body.len() > self.max_body {
                 break; // the crate reports anything longer than the limit as `TooLarge`
             }
@@ -74,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let endpoint = Endpoint::parse(&env("CLOUDSET_URL")?, Transport::RequireHttps)?;
-    let config = ClientConfig::new("cloudset-example/0.2");
+    let config = ClientConfig::new("cloudset-example/0.3");
     let executor = Executor::new(config.limits.max_body_bytes)?;
     let client = Client::new(Connection::webdav(endpoint, env("CLOUDSET_USER")?, env("CLOUDSET_PASSWORD")?), config);
 

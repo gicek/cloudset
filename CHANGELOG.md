@@ -4,6 +4,87 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-20
+
+Makes write guarantees explicit: a condition a provider cannot enforce is refused before anything is sent, and a write
+whose outcome could not be verified is reported as such. Adds sign-in with Google "Desktop app" clients over a
+loopback redirect. This release changes behavior; see "Changed" for the migration.
+
+### Added
+
+- `Client::supports_write_precondition(size, &precondition)` tells whether the backend can enforce a condition for a
+  payload of that size.
+- `CloudError::UnsupportedPrecondition`: the provider cannot enforce the requested condition; nothing was sent.
+- `CloudError::CommitUnconfirmed`: a mutation may have been committed but could not be verified. Read the remote
+  again and compare before retrying or recording a successful sync.
+- `Operation::take_connection()` hands over a refreshed connection right after the advance that produced it, so a
+  rotated credential survives an operation that fails or is dropped afterwards. `Done::connection` still carries any
+  update that was not taken. `run_with_updates` is `run` with a callback for these updates.
+- `OAuthClient::with_client_secret` for Google "Desktop app" clients, whose token endpoint answers
+  `client_secret is missing` without it. The secret is sent with the code exchange and every refresh and is stored
+  in the connection. Together with a loopback redirect (`http://127.0.0.1:<port>/`) this covers sign-in on Windows,
+  Linux and macOS.
+- Testing: `MemoryCloud::client_secret` makes the token endpoint require a client secret.
+- Testing: `MemoryCloud::bare_etags` makes the OneDrive server return unquoted `eTag` tokens, as personal accounts do.
+
+### Changed
+
+- Google Drive refuses `Precondition::Absent` and `Precondition::Matches` with `UnsupportedPrecondition`. The earlier
+  emulation could not close the race, and it no longer replays historical revisions or deletes folders. Use
+  `Precondition::None` with your own conflict handling.
+- Google Drive: when another device creates the same name concurrently, `write` removes the file it just created and
+  reports `CommitUnconfirmed`; `rename` leaves both items and reports `CommitUnconfirmed` instead of undoing the move.
+  A duplicate folder is left in place and the oldest one is used.
+- OneDrive refuses `Matches` for a payload that needs an upload session (larger than `Limits::upload_chunk_bytes`),
+  because Graph only checks it when the session opens. Smaller writes use a single `PUT` up to that limit. A
+  revision that is a wildcard, a weak tag or a list is refused as well; quoted and bare `eTag` values both match.
+- WebDAV refuses `Matches` with a weak or malformed ETag instead of comparing before writing. Reads from a server
+  without strong ETags return no revision and no modification time.
+- WebDAV writes read the file back and compare it with what was sent before returning its revision, which costs one
+  more `PROPFIND` and `GET`. A payload larger than `Limits::max_body_bytes` skips the check and returns no revision.
+- An OAuth callback must arrive on the port of the registered redirect, not only its scheme, host and path.
+- `write` and `delete` on the connection root report `InvalidPath` on every provider.
+- `Debug` output of requests shows only the origin of the URL; pre-signed URLs carry credentials in the path.
+- The published source archive includes the integration guide, provider notes and contributor and security policies.
+
+### Fixed
+
+- A WebDAV write no longer returns the revision of a write another device made right after it.
+- Google Drive name lookups follow pagination, including pages without items, and refuse incomplete search results.
+- OneDrive upload fragments stay strictly below 60 MiB.
+- An expiry time far in the future no longer overflows; a stored connection with one is `InvalidConnection`.
+- A `303` redirect is only followed for `GET`. For any other request it is an `InvalidResponse`, where it used to run
+  a `GET` and report that as the result of the delete or the new directory.
+- Redirects only lead to `http` and `https` URLs without credentials in them, drop the fragment, and carry a `MOVE`
+  `Destination` along when the server upgrades to HTTPS. Nextcloud sign-in refuses a login or poll URL with another
+  scheme.
+- WebDAV `list` no longer returns an empty directory when the server's paths do not match the endpoint
+  (`InvalidResponse`) or when the path is a file, and only returns direct children when the server ignores `Depth`.
+- WebDAV: a `404` or `403` status for a whole multistatus entry is honored (`stat` returns `None`, `list` leaves the
+  entry out), elements nested in a property value are not read as entries, and any number of `propstat` elements is
+  merged without growing memory.
+- WebDAV paths encode `[`, `]`, `|` and `^`.
+- Nextcloud sign-in: when the user ID lookup fails after the app password was issued, the connection uses
+  `remote.php/webdav/` instead of losing the password. A server reached over HTTP that names its HTTPS address is
+  used over HTTPS from then on.
+- Dropbox: `too_many_write_operations` is `RateLimited`, a move without space is `QuotaExceeded`, listing a file is
+  `NotFound`, and a file or folder in the way of a write is `Forbidden` instead of `PreconditionFailed`. Revoking a
+  grant the user already removed succeeds.
+- OneDrive: `create_dir` works in the app folder, where Graph answers `invalidRequest` to a folder created by path;
+  the parent is looked up and the folder created under its ID.
+- OneDrive: a `Matches` write to a file that no longer exists is `PreconditionFailed` and leaves nothing behind.
+  Graph ignores `If-Match` there and creates the file, which used to count as a successful write.
+- OneDrive: a folder in the way of a write is `Forbidden` (`PreconditionFailed` for `Absent`), listing a file is
+  `NotFound`, and a move whose source is missing is `NotFound` instead of `InvalidPath`.
+- OneDrive: a refusal from a pre-signed download or upload URL is `Server` instead of `ReauthRequired`, `Forbidden`
+  or `InvalidPath`.
+- Google Drive: a partially acknowledged chunk no longer overflows with a very large `Limits::upload_chunk_bytes`.
+- Token endpoints: `temporarily_unavailable` is `RateLimited` and `server_error` is `Server` instead of
+  `ReauthRequired`.
+- Timestamps outside 1970–9999 or with negative fields from a provider are ignored instead of overflowing.
+- A single-request operation that failed reports `OutOfOrder` when advanced again, as documented.
+- `Endpoint::complete_address` adds the scheme to an address whose path or query contains `://`.
+
 ## [0.2.0] - 2026-11-19
 
 Adds Dropbox, OneDrive and Google Drive, chunked uploads for large files, moving and renaming, and pinned certificates.
@@ -100,5 +181,6 @@ This release changes the public API; see "Changed" for the migration.
 - Nextcloud: Login Flow v2 (`begin_login` / `poll_login`, looking up the user ID for the WebDAV address) and revocation of
   the app password.
 
-[Unreleased]: https://github.com/gicek/cloudset/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/gicek/cloudset/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/gicek/cloudset/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gicek/cloudset/releases/tag/v0.2.0

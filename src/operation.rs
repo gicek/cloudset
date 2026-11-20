@@ -62,6 +62,13 @@ pub trait Operation: Send {
     /// The result type.
     type Output;
 
+    /// Takes a newly refreshed connection. Call after every advance, including an error, before sending the next request.
+    /// Persist it immediately so cancelling an operation or losing transport cannot discard a rotated credential.
+    /// For drivers that do not take updates early, a successful operation returns the update in [`Done::connection`].
+    fn take_connection(&mut self) -> Option<Connection> {
+        None
+    }
+
     /// Advances the operation. Pass `None` on the first call, then the response to the previous request. Calling it
     /// again after it returned [`Step::Done`] or an error reports [`CloudError::OutOfOrder`].
     ///
@@ -76,6 +83,9 @@ pub type BoxOperation<T> = Box<dyn Operation<Output = T>>;
 
 /// Runs an operation to completion with a synchronous transport function that cannot fail, such as an in-memory test
 /// server. For a real network, write the loop yourself so the transport can report its own errors (see the README).
+///
+/// A connection update only comes back in [`Done::connection`]: when the operation fails after refreshing a token,
+/// the update is dropped. Use [`run_with_updates`] wherever a rotated credential must survive that.
 ///
 /// # Errors
 ///
@@ -103,12 +113,55 @@ pub fn run<T>(
     }
 }
 
+/// Like [`run`], but hands every connection update to `store` as soon as it exists and before the next request is
+/// sent, so a rotated credential survives an operation that fails afterwards. The update never comes back a second
+/// time in the result.
+///
+/// # Errors
+///
+/// The first error the operation reports.
+///
+/// ```
+/// # use cloudset::{run_with_updates, Client, ClientConfig, Connection, Endpoint, HttpResponse, RemotePath, Transport};
+/// # let endpoint = Endpoint::parse("https://dav.example.com/", Transport::RequireHttps)?;
+/// # let client = Client::new(Connection::webdav(endpoint, "alice", "secret"), ClientConfig::new("example/1.0"));
+/// let mut latest = None;
+/// let mut stat = client.stat(RemotePath::parse("missing.txt")?);
+/// let entry = run_with_updates(stat.as_mut(), |_request| HttpResponse::new(404), |connection| latest = Some(connection))?;
+/// assert!(entry.is_none() && latest.is_none());
+/// # Ok::<(), cloudset::CloudError>(())
+/// ```
+pub fn run_with_updates<T>(
+    operation: &mut dyn Operation<Output = T>,
+    mut transport: impl FnMut(HttpRequest) -> HttpResponse,
+    mut store: impl FnMut(Connection),
+) -> Result<T, CloudError> {
+    let mut response = None;
+    loop {
+        let step = operation.advance(response.take());
+        if let Some(connection) = operation.take_connection() {
+            store(connection);
+        }
+        match step? {
+            Step::Send(request) => response = Some(transport(request)),
+            Step::Done(done) => {
+                if let Some(connection) = done.connection {
+                    store(connection);
+                }
+                return Ok(done.value);
+            }
+        }
+    }
+}
+
 /// Send state of one request (including redirects).
 pub(crate) struct Call {
     exchange: Exchange,
     origin: Origin,
     limits: Limits,
     sent: bool,
+    /// The final response or an error was handed out: every further call is out of order.
+    finished: bool,
 }
 
 pub(crate) enum CallStep {
@@ -118,7 +171,7 @@ pub(crate) enum CallStep {
 
 impl Call {
     pub(crate) fn new(request: HttpRequest, origin: Origin, limits: Limits) -> Self {
-        Self { exchange: Exchange::new(request), origin, limits, sent: false }
+        Self { exchange: Exchange::new(request), origin, limits, sent: false, finished: false }
     }
 
     /// Hands 3xx responses back instead of following them.
@@ -128,17 +181,20 @@ impl Call {
     }
 
     pub(crate) fn advance(&mut self, response: Option<HttpResponse>) -> Result<CallStep, CloudError> {
-        match (self.sent, response) {
+        let step = match (self.sent, response) {
+            _ if self.finished => Err(CloudError::OutOfOrder),
             (false, None) => {
                 self.sent = true;
                 Ok(CallStep::Send(self.exchange.request()))
             }
-            (true, Some(response)) => match self.exchange.receive(response, &self.origin, &self.limits)? {
-                Received::Resend(request) => Ok(CallStep::Send(request)),
-                Received::Final(response) => Ok(CallStep::Response(response)),
-            },
+            (true, Some(response)) => self.exchange.receive(response, &self.origin, &self.limits).map(|received| match received {
+                Received::Resend(request) => CallStep::Send(request),
+                Received::Final(response) => CallStep::Response(response),
+            }),
             _ => Err(CloudError::OutOfOrder),
-        }
+        };
+        self.finished = !matches!(step, Ok(CallStep::Send(_)));
+        step
     }
 }
 
@@ -222,6 +278,10 @@ struct Map<T, F> {
 impl<T, U, F: FnMut(T) -> U + Send> Operation for Map<T, F> {
     type Output = U;
 
+    fn take_connection(&mut self) -> Option<Connection> {
+        self.operation.take_connection()
+    }
+
     fn advance(&mut self, response: Option<HttpResponse>) -> Result<Step<U>, CloudError> {
         Ok(match self.operation.advance(response)? {
             Step::Send(request) => Step::Send(request),
@@ -264,7 +324,11 @@ impl<T> Subtask<T> {
 
     /// Advances the sub-operation; if it finishes with a new connection, writes it to `connection`.
     pub fn advance(&mut self, response: Option<HttpResponse>, connection: &mut Option<Connection>) -> Progress<T> {
-        match self.operation.advance(response) {
+        let result = self.operation.advance(response);
+        if let Some(update) = self.operation.take_connection() {
+            *connection = Some(update);
+        }
+        match result {
             Ok(Step::Send(request)) => Progress::Send(request),
             Ok(Step::Done(done)) => {
                 if done.connection.is_some() {

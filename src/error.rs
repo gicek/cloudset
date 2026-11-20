@@ -20,6 +20,12 @@ pub enum CloudError {
     /// required).
     #[error("remote changed since it was last read")]
     PreconditionFailed,
+    /// This provider cannot enforce the requested write precondition atomically. No write was started.
+    #[error("atomic write precondition is unsupported")]
+    UnsupportedPrecondition,
+    /// A mutation may have committed, but its outcome could not be verified. Reconcile before retrying.
+    #[error("remote commit could not be confirmed")]
+    CommitUnconfirmed,
     /// The storage is full.
     #[error("storage quota exceeded")]
     QuotaExceeded,

@@ -11,15 +11,13 @@
 //! The version is the file's `headRevisionId`. Reading downloads `alt=media`, then fetches the metadata again to check the
 //! version, retrying if it changed in between (at most 3 times).
 //!
-//! Drive v3 has no conditional writes, so they are emulated:
-//! - `Matches(rev)`: compare the head revision before uploading; after uploading, list the revisions and check that the
-//!   one right before ours is still `rev`. If another device wrote in between, its revision is downloaded and uploaded
-//!   again on top of ours (so its data stays the current version and no one's write is silently lost), and the write
-//!   reports `PreconditionFailed`. Only a third write inside that window, or Drive pruning revisions within seconds,
-//!   escapes this; the check is best-effort when the revision list cannot be read.
-//! - `Absent`: look the name up before creating; after creating, look it up again. If another device created the same
-//!   name concurrently, the oldest file wins and the newer one is deleted by its writer, which reports
-//!   `PreconditionFailed`. Folders created along the way are deduplicated the same way.
+//! Conditional path writes are refused before sending requests. A revision check followed by an upload cannot
+//! protect a concurrent update, and Drive allows multiple files with the same name.
+//!
+//! Creating looks the name up again afterwards. A listing that does not show the new item yet is not a failure: the
+//! create response already named it. When an older item with the same name turns up, another device created it
+//! concurrently: a file just created here is deleted again (nothing else refers to it yet) and the write reports
+//! `CommitUnconfirmed`; folders and moved items are left alone, because another device may already be using them.
 //!
 //! New files are created with one multipart upload (metadata + content), so no device ever sees an empty file. Files over
 //! 5 MiB (or [`crate::Limits::upload_chunk_bytes`]) use a resumable upload session instead, which is just as atomic: the
@@ -30,12 +28,11 @@ use std::time::SystemTime;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::authorized::{Authorized, Next, Outgoing, Steps};
 use crate::client::ClientConfig;
-use crate::connection::{AccessScope, Connection};
+use crate::connection::Connection;
 use crate::entry::{Entry, File, Precondition, Revision};
 use crate::error::CloudError;
 use crate::http::{HttpRequest, HttpResponse, Method, retry_after, status_error};
@@ -43,16 +40,25 @@ use crate::operation::{BoxOperation, Ready};
 use crate::path::RemotePath;
 use crate::providers::{json_request, parse_utc};
 
+mod upload;
+mod walk;
+
+use upload::{CHUNK_UNIT, Target, Upload, Uploaded};
+use walk::{Drive, Lookup, LookupResult, Walk, Walked};
+
 const API: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3";
 const REVOKE: &str = "https://oauth2.googleapis.com/revoke";
 const FOLDER: &str = "application/vnd.google-apps.folder";
 const FIELDS: &str = "id,name,mimeType,size,modifiedTime,createdTime,headRevisionId";
 const READ_ATTEMPTS: u8 = 3;
-/// Name lookups return every duplicate (they are rare) so that all devices pick the same one.
+/// Fetch duplicates in bounded pages, including ties across page boundaries.
 const LOOKUP_PAGE: usize = 100;
-/// The maximum page size of `files.list` and `revisions.list`.
+/// The page size for listing a directory.
 const LIST_PAGE: usize = 1000;
+/// Drive may return a page without items but with a token for the next one. Pages with items are bounded by
+/// [`crate::Limits::max_entries`]; this bounds the ones without.
+const EMPTY_PAGES: usize = 32;
 /// Drive IDs are `[A-Za-z0-9_-]`; anything else is encoded anyway before it goes into a URL path.
 const ID: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_');
 
@@ -108,6 +114,9 @@ fn json_body(response: &HttpResponse) -> Result<Value, CloudError> {
 /// Items of a `files.list` page, oldest first (ties broken by ID), and the next page token.
 fn files(response: &HttpResponse) -> Result<(Vec<Item>, Option<String>), CloudError> {
     let json = json_body(response)?;
+    if json.get("incompleteSearch").and_then(Value::as_bool) == Some(true) {
+        return Err(CloudError::InvalidResponse("incomplete Drive search"));
+    }
     let mut items = json
         .get("files")
         .and_then(Value::as_array)
@@ -118,12 +127,6 @@ fn files(response: &HttpResponse) -> Result<(Vec<Item>, Option<String>), CloudEr
     oldest_first(&mut items);
     let next = json.get("nextPageToken").and_then(Value::as_str).filter(|token| !token.is_empty()).map(str::to_owned);
     Ok((items, next))
-}
-
-/// The oldest item named exactly `name` in a lookup response. The query already filters by name; comparing again keeps the
-/// match exact whatever the server's notion of equal names (case, normalization).
-fn oldest_named(response: &HttpResponse, name: &str) -> Result<Option<Item>, CloudError> {
-    Ok(files(response)?.0.into_iter().find(|item| item.name == name))
 }
 
 fn oldest_first(items: &mut [Item]) {
@@ -174,7 +177,7 @@ fn search_url(query: &str, page_size: usize, page_token: Option<&str>) -> String
     params
         .append_pair("q", query)
         .append_pair("orderBy", "createdTime")
-        .append_pair("fields", &format!("nextPageToken,files({FIELDS})"))
+        .append_pair("fields", &format!("nextPageToken,incompleteSearch,files({FIELDS})"))
         .append_pair("pageSize", &page_size.to_string())
         .append_pair("spaces", "drive");
     if let Some(token) = page_token {
@@ -196,10 +199,6 @@ fn download(url: String) -> Outgoing {
     Outgoing::authorized(HttpRequest { method: Method::Get, url, headers: Vec::new(), body: Vec::new() })
 }
 
-fn lookup(parent: &str, name: &str, folders_only: bool) -> Outgoing {
-    get(search_url(&children_query(parent, Some(name), folders_only), LOOKUP_PAGE, None))
-}
-
 fn metadata(id: &str) -> Outgoing {
     get(file_url(API, id, &format!("?fields={FIELDS}")))
 }
@@ -213,153 +212,6 @@ fn create_folder(parent: &str, name: &str) -> Outgoing {
     Outgoing::authorized(json_request(Method::Post, &format!("{API}/files?fields={FIELDS}"), Some(&body)))
 }
 
-/// Creates a file with its content in one request (`multipart/related`: JSON metadata, then the bytes). The boundary is
-/// derived from a hash of the content, so it cannot occur in it.
-fn create_file(parent: &str, name: &str, data: &[u8]) -> Outgoing {
-    let digest = Sha256::digest(data);
-    let boundary = format!("cloudset-{}", digest[..16].iter().map(|byte| format!("{byte:02x}")).collect::<String>());
-    let metadata = json!({ "name": name, "parents": [parent] });
-    let mut body = format!(
-        "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n"
-    )
-    .into_bytes();
-    body.extend_from_slice(data);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    Outgoing::authorized(HttpRequest {
-        method: Method::Post,
-        url: format!("{UPLOAD}/files?uploadType=multipart&fields={FIELDS}"),
-        headers: vec![
-            ("Accept".into(), "application/json".into()),
-            ("Content-Type".into(), format!("multipart/related; boundary={boundary}")),
-        ],
-        body,
-    })
-}
-
-/// Replaces a file's content (a new head revision); the metadata is unchanged.
-fn upload_content(id: &str, data: Vec<u8>) -> Outgoing {
-    Outgoing::authorized(HttpRequest {
-        method: Method::Patch,
-        url: file_url(UPLOAD, id, &format!("?uploadType=media&fields={FIELDS}")),
-        headers: vec![("Accept".into(), "application/json".into()), ("Content-Type".into(), "application/octet-stream".into())],
-        body: data,
-    })
-}
-
-/// Single-request uploads (multipart create, media update) are meant for files up to 5 MiB; larger ones use a resumable
-/// session.
-const SINGLE_REQUEST: usize = 5 * 1024 * 1024;
-/// Resumable chunks must be multiples of 256 KiB.
-const CHUNK_UNIT: usize = 256 * 1024;
-
-/// What an upload writes: a new file in a folder, or a new revision of an existing file.
-enum Target {
-    New { parent: String, name: String },
-    Existing { id: String },
-}
-
-enum UploadState {
-    Idle,
-    /// A single request (multipart create or media update).
-    Single,
-    /// The resumable session is being opened.
-    Opening,
-    /// A chunk sent to the session URI.
-    Chunk {
-        session: String,
-        start: usize,
-    },
-}
-
-/// One upload: a single request for small files, a resumable session for larger ones (Drive's 308 "Resume Incomplete"
-/// responses are progress, not redirects).
-struct Upload {
-    target: Target,
-    data: Zeroizing<Vec<u8>>,
-    chunk: usize,
-    state: UploadState,
-}
-
-enum Uploaded {
-    Send(Outgoing),
-    Done(Item),
-    /// The single request or the session opening failed with this response; the caller maps it.
-    Failed(HttpResponse),
-}
-
-impl Upload {
-    fn new(target: Target, data: Vec<u8>, chunk: usize) -> Self {
-        Self { target, data: Zeroizing::new(data), chunk, state: UploadState::Idle }
-    }
-
-    fn start(&mut self) -> Outgoing {
-        if self.data.len() <= self.chunk.min(SINGLE_REQUEST) {
-            self.state = UploadState::Single;
-            return match &self.target {
-                Target::New { parent, name } => create_file(parent, name, &self.data),
-                Target::Existing { id } => upload_content(id, self.data.to_vec()),
-            };
-        }
-        self.state = UploadState::Opening;
-        let request = match &self.target {
-            Target::New { parent, name } => json_request(
-                Method::Post,
-                &format!("{UPLOAD}/files?uploadType=resumable&fields={FIELDS}"),
-                Some(&json!({ "name": name, "parents": [parent] })),
-            ),
-            Target::Existing { id } => {
-                json_request(Method::Patch, &file_url(UPLOAD, id, &format!("?uploadType=resumable&fields={FIELDS}")), Some(&json!({})))
-            }
-        };
-        Outgoing::authorized(
-            request
-                .with_header("X-Upload-Content-Type", "application/octet-stream")
-                .with_header("X-Upload-Content-Length", self.data.len().to_string()),
-        )
-    }
-
-    fn chunk(&mut self, session: String, start: usize) -> Outgoing {
-        let end = (start + self.chunk).min(self.data.len());
-        let request = HttpRequest::new(Method::Put, session.clone())
-            .with_header("Content-Range", format!("bytes {start}-{}/{}", end - 1, self.data.len()))
-            .with_body(self.data[start..end].to_vec());
-        self.state = UploadState::Chunk { session, start };
-        Outgoing::authorized(request).without_redirects()
-    }
-
-    fn receive(&mut self, response: HttpResponse) -> Result<Uploaded, CloudError> {
-        match std::mem::replace(&mut self.state, UploadState::Idle) {
-            UploadState::Single | UploadState::Opening if response.status != 200 => Ok(Uploaded::Failed(response)),
-            UploadState::Single => Ok(Uploaded::Done(Item::parse(&json_body(&response)?)?)),
-            UploadState::Opening => {
-                let session = response.header("Location").ok_or(CloudError::InvalidResponse("upload session url"))?;
-                if !crate::providers::is_api_url(crate::ProviderKind::GoogleDrive, session) {
-                    return Err(CloudError::InvalidResponse("upload session url"));
-                }
-                Ok(Uploaded::Send(self.chunk(session.to_owned(), 0)))
-            }
-            UploadState::Chunk { session, start } => match response.status {
-                200 | 201 => Ok(Uploaded::Done(Item::parse(&json_body(&response)?)?)),
-                308 => {
-                    // `Range: bytes=0-N` is what the server has; continue after it. No progress means a broken session.
-                    let next = response
-                        .header("Range")
-                        .and_then(|range| range.strip_prefix("bytes=0-"))
-                        .and_then(|last| last.parse::<usize>().ok())
-                        .map(|last| last + 1)
-                        // Never past what was sent: skipping bytes would commit a file with a hole in it.
-                        .filter(|next| *next > start && *next <= (start + self.chunk).min(self.data.len() - 1))
-                        .ok_or(CloudError::InvalidResponse("upload session range"))?;
-                    Ok(Uploaded::Send(self.chunk(session, next)))
-                }
-                404 | 410 => Err(CloudError::InvalidResponse("upload session")),
-                _ => Err(error_for(&response)),
-            },
-            UploadState::Idle => Err(CloudError::OutOfOrder),
-        }
-    }
-}
-
 /// Moves and renames an item in one request; parents are only sent when they change.
 fn move_item(id: &str, name: &str, from_parent: &str, to_parent: &str) -> Outgoing {
     let mut url = file_url(API, id, &format!("?fields={FIELDS}"));
@@ -369,144 +221,7 @@ fn move_item(id: &str, name: &str, from_parent: &str, to_parent: &str) -> Outgoi
     Outgoing::authorized(json_request(Method::Patch, &url, Some(&json!({ "name": name }))))
 }
 
-fn revisions(id: &str, page_token: Option<&str>) -> Outgoing {
-    let mut url = file_url(API, id, &format!("/revisions?fields=nextPageToken,revisions(id)&pageSize={LIST_PAGE}"));
-    if let Some(token) = page_token {
-        url.push_str("&pageToken=");
-        url.push_str(&url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>());
-    }
-    get(url)
-}
-
 // MARK: - Path resolution
-
-#[derive(Clone)]
-struct Drive {
-    /// Name of the app folder in My Drive; `None` with the `drive` scope.
-    app_folder: Option<String>,
-}
-
-impl Drive {
-    fn of(connection: &Connection) -> Result<Self, CloudError> {
-        let credential = connection.oauth_credential().ok_or(CloudError::InvalidConnection)?;
-        let app_folder = match credential.access {
-            AccessScope::AppFolder => Some(credential.folder_name.clone().ok_or(CloudError::InvalidConnection)?),
-            AccessScope::Full => None,
-        };
-        Ok(Self { app_folder })
-    }
-
-    /// Resolves `path`; with `create_parents`, missing directories above the last segment are created. The app folder
-    /// itself is always created when missing, so that it exists (and shows up in My Drive) right after sign-in.
-    fn walk(&self, path: &RemotePath, create_parents: bool) -> Walk {
-        let mut segments: Vec<String> = self.app_folder.iter().cloned().collect();
-        let base = segments.len();
-        segments.extend(path.segments().iter().cloned());
-        let create = if create_parents { base.max(segments.len().saturating_sub(1)) } else { base };
-        Walk { segments, create, depth: 0, current: Item::drive_root(), parent: None, state: WalkState::Idle }
-    }
-
-    /// Whether the operation on `path` needs no request to find it (the root of My Drive).
-    fn is_drive_root(&self, path: &RemotePath) -> bool {
-        self.app_folder.is_none() && path.is_root()
-    }
-}
-
-enum WalkState {
-    Idle,
-    Lookup,
-    Create,
-    /// Created a folder; looking the name up again to see whether another device created one at the same time.
-    Recheck(Item),
-    /// Another device's folder is older: deleting ours, then continuing in theirs.
-    Discard(Item),
-}
-
-/// Resolves a path segment by segment from the drive root.
-struct Walk {
-    /// From the drive root, including the app folder.
-    segments: Vec<String>,
-    /// Directories are created when missing at depths below this.
-    create: usize,
-    /// Segments resolved so far; `current` is the item at this depth.
-    depth: usize,
-    current: Item,
-    parent: Option<Item>,
-    state: WalkState,
-}
-
-enum Walked {
-    Send(Outgoing),
-    /// `item` is the whole path, `parent` the item one level above it (also when the last segment is missing).
-    Found {
-        item: Option<Item>,
-        parent: Option<Item>,
-    },
-}
-
-impl Walk {
-    fn step(&mut self) -> Walked {
-        if self.depth == self.segments.len() {
-            return Walked::Found { item: Some(self.current.clone()), parent: self.parent.clone() };
-        }
-        self.state = WalkState::Lookup;
-        Walked::Send(lookup(&self.current.id, &self.segments[self.depth], self.depth + 1 < self.segments.len()))
-    }
-
-    fn descend(&mut self, item: Item) -> Walked {
-        self.parent = Some(std::mem::replace(&mut self.current, item));
-        self.depth += 1;
-        self.step()
-    }
-
-    fn receive(&mut self, response: HttpResponse) -> Result<Walked, CloudError> {
-        match std::mem::replace(&mut self.state, WalkState::Idle) {
-            WalkState::Lookup => {
-                if response.status != 200 {
-                    return Err(error_for(&response));
-                }
-                match oldest_named(&response, &self.segments[self.depth])? {
-                    Some(item) => Ok(self.descend(item)),
-                    None if self.depth < self.create => {
-                        self.state = WalkState::Create;
-                        Ok(Walked::Send(create_folder(&self.current.id, &self.segments[self.depth])))
-                    }
-                    None => {
-                        let parent = (self.depth + 1 == self.segments.len()).then(|| self.current.clone());
-                        Ok(Walked::Found { item: None, parent })
-                    }
-                }
-            }
-            WalkState::Create => {
-                if response.status != 200 {
-                    return Err(error_for(&response));
-                }
-                let created = Item::parse(&json_body(&response)?)?;
-                self.state = WalkState::Recheck(created);
-                Ok(Walked::Send(lookup(&self.current.id, &self.segments[self.depth], true)))
-            }
-            WalkState::Recheck(created) => {
-                if response.status != 200 {
-                    return Err(error_for(&response));
-                }
-                // An empty result (the listing lagging behind the create) keeps ours.
-                match oldest_named(&response, &self.segments[self.depth])? {
-                    Some(winner) if winner.id != created.id => {
-                        let discard = delete(&created.id);
-                        self.state = WalkState::Discard(winner);
-                        Ok(Walked::Send(discard))
-                    }
-                    _ => Ok(self.descend(created)),
-                }
-            }
-            WalkState::Discard(winner) => match response.status {
-                200 | 204 | 404 => Ok(self.descend(winner)),
-                _ => Err(error_for(&response)),
-            },
-            WalkState::Idle => Err(CloudError::OutOfOrder),
-        }
-    }
-}
 
 /// The first request of an operation: the walk must need one (operations whose walk finishes immediately are handled
 /// before they start).
@@ -547,7 +262,7 @@ impl Steps for Stat {
 }
 
 pub(crate) fn stat(connection: &Connection, config: &ClientConfig, path: RemotePath) -> BoxOperation<Option<Entry>> {
-    match Drive::of(connection) {
+    match Drive::of(connection, config) {
         Ok(drive) if drive.is_drive_root(&path) => Box::new(Ready::ok(Some(Item::drive_root().entry(path)))),
         drive => op(drive.map(|drive| Stat { walk: drive.walk(&path, false), path }), connection, config),
     }
@@ -559,6 +274,7 @@ struct List {
     folder: Option<String>,
     items: Vec<Item>,
     max_entries: usize,
+    empty_pages: usize,
 }
 
 impl List {
@@ -616,6 +332,9 @@ impl Steps for List {
             });
         }
         let (items, next) = files(&response)?;
+        if items.is_empty() && next.is_some() {
+            self.empty_pages = self.empty_pages.checked_sub(1).ok_or(CloudError::TooLarge)?;
+        }
         if self.items.len() + items.len() > self.max_entries {
             return Err(CloudError::TooLarge);
         }
@@ -629,12 +348,13 @@ impl Steps for List {
 
 pub(crate) fn list(connection: &Connection, config: &ClientConfig, dir: RemotePath) -> BoxOperation<Vec<Entry>> {
     op(
-        Drive::of(connection).map(|drive| List {
+        Drive::of(connection, config).map(|drive| List {
             walk: drive.walk(&dir, false),
             dir,
             folder: None,
             items: Vec::new(),
             max_entries: config.limits.max_entries,
+            empty_pages: EMPTY_PAGES,
         }),
         connection,
         config,
@@ -713,7 +433,7 @@ pub(crate) fn read(connection: &Connection, config: &ClientConfig, path: RemoteP
         return Box::new(Ready::err(CloudError::InvalidPath));
     }
     op(
-        Drive::of(connection).map(|drive| Read { walk: drive.walk(&path, false), path, attempts: 0, state: ReadState::Walking }),
+        Drive::of(connection, config).map(|drive| Read { walk: drive.walk(&path, false), path, attempts: 0, state: ReadState::Walking }),
         connection,
         config,
     )
@@ -723,95 +443,24 @@ pub(crate) fn read(connection: &Connection, config: &ClientConfig, path: RemoteP
 
 enum WriteState {
     Walking,
-    /// Creating a new file in this folder.
-    Creating {
-        parent: Item,
-        upload: Upload,
-    },
-    /// Looking the name up again after creating `ours`.
-    Dedupe {
-        ours: Item,
-    },
-    /// Another device's file is older: deleting ours.
-    Discard {
-        winner: Item,
-    },
     Uploading {
         upload: Upload,
+        parent: Option<Item>,
     },
-    /// Listing the revisions of the file just written (`ours`) to check the one before it.
-    Revisions {
+    Verify {
         ours: Item,
-        expected: Revision,
-        ids: Vec<String>,
+        lookup: Lookup,
     },
-    /// Another device's revision was overwritten: downloading it to put it back.
-    Restore {
-        ours: Item,
-    },
-    Restoring {
-        upload: Upload,
-    },
+    /// An older file with the name exists: deleting the one just created.
+    Discard,
 }
 
 struct Write {
     walk: Walk,
     path: RemotePath,
     data: Zeroizing<Vec<u8>>,
-    precondition: Precondition,
     chunk: usize,
     state: WriteState,
-}
-
-impl Write {
-    fn name(&self) -> Result<&str, CloudError> {
-        self.path.name().ok_or(CloudError::InvalidPath)
-    }
-
-    fn upload(&mut self, target: &Item) -> Next<Entry> {
-        let mut upload = Upload::new(Target::Existing { id: target.id.clone() }, self.data.to_vec(), self.chunk);
-        let request = upload.start();
-        self.state = WriteState::Uploading { upload };
-        Next::Request(request)
-    }
-
-    fn found(&mut self, item: Option<Item>, parent: Option<Item>) -> Result<Next<Entry>, CloudError> {
-        match (item, &self.precondition) {
-            (Some(_), Precondition::Absent) => Err(CloudError::PreconditionFailed),
-            (Some(item), Precondition::Matches(_)) if item.is_dir => Err(CloudError::PreconditionFailed),
-            (Some(item), _) if item.is_dir => Err(CloudError::Forbidden),
-            (Some(item), Precondition::Matches(expected)) if item.revision.as_ref() != Some(expected) => {
-                Err(CloudError::PreconditionFailed)
-            }
-            (Some(item), _) => Ok(self.upload(&item)),
-            (None, Precondition::Matches(_)) => Err(CloudError::PreconditionFailed),
-            (None, _) => {
-                let parent = parent.ok_or(CloudError::NotFound)?;
-                let target = Target::New { parent: parent.id.clone(), name: self.name()?.to_owned() };
-                let mut upload = Upload::new(target, self.data.to_vec(), self.chunk);
-                let request = upload.start();
-                self.state = WriteState::Creating { parent, upload };
-                Ok(Next::Request(request))
-            }
-        }
-    }
-
-    /// The new head revision is ours: check for an overtaken writer when the write was conditional.
-    fn uploaded(&mut self, ours: Item) -> Next<Entry> {
-        match &self.precondition {
-            Precondition::Matches(expected) => {
-                let request = revisions(&ours.id, None);
-                self.state = WriteState::Revisions { ours, expected: expected.clone(), ids: Vec::new() };
-                Next::Request(request)
-            }
-            _ => Next::Done(ours.entry(self.path.clone())),
-        }
-    }
-
-    /// The verification after an upload could not run: the write itself succeeded, so report it as such.
-    fn unverified(ours: &Item, path: &RemotePath) -> Next<Entry> {
-        Next::Done(ours.entry(path.clone()))
-    }
 }
 
 impl Steps for Write {
@@ -824,93 +473,53 @@ impl Steps for Write {
     fn next(&mut self, response: HttpResponse) -> Result<Next<Entry>, CloudError> {
         match std::mem::replace(&mut self.state, WriteState::Walking) {
             WriteState::Walking => match self.walk.receive(response)? {
-                Walked::Send(outgoing) => Ok(Next::Request(outgoing)),
-                Walked::Found { item, parent } => self.found(item, parent),
+                Walked::Send(request) => Ok(Next::Request(request)),
+                Walked::Found { item, parent } => {
+                    let (target, parent) = match item {
+                        Some(item) if item.is_dir => return Err(CloudError::Forbidden),
+                        Some(item) => (Target::Existing { id: item.id }, None),
+                        None => {
+                            let parent = parent.ok_or(CloudError::NotFound)?;
+                            let name = self.path.name().ok_or(CloudError::InvalidPath)?.to_owned();
+                            (Target::New { parent: parent.id.clone(), name }, Some(parent))
+                        }
+                    };
+                    let mut upload = Upload::new(target, std::mem::take(&mut *self.data), self.chunk);
+                    let request = upload.start();
+                    self.state = WriteState::Uploading { upload, parent };
+                    Ok(Next::Request(request))
+                }
             },
-            WriteState::Creating { parent, mut upload } => match upload.receive(response)? {
+            WriteState::Uploading { mut upload, parent } => match upload.receive(response)? {
                 Uploaded::Send(request) => {
-                    self.state = WriteState::Creating { parent, upload };
+                    self.state = WriteState::Uploading { upload, parent };
                     Ok(Next::Request(request))
                 }
                 Uploaded::Done(ours) => {
-                    let request = lookup(&parent.id, self.name()?, false);
-                    self.state = WriteState::Dedupe { ours };
+                    let Some(parent) = parent else { return Ok(Next::Done(ours.entry(self.path.clone()))) };
+                    let name = self.path.name().ok_or(CloudError::InvalidPath)?;
+                    let lookup = Lookup::new(&parent.id, name, false, self.walk.limit);
+                    let request = lookup.page(None);
+                    self.state = WriteState::Verify { ours, lookup };
                     Ok(Next::Request(request))
                 }
                 Uploaded::Failed(response) => Err(error_for(&response)),
             },
-            WriteState::Dedupe { ours } => {
-                if response.status != 200 {
-                    return Ok(Self::unverified(&ours, &self.path));
-                }
-                match oldest_named(&response, self.name()?)? {
-                    Some(winner) if winner.id != ours.id => {
-                        self.state = WriteState::Discard { winner };
-                        Ok(Next::Request(delete(&ours.id)))
-                    }
-                    _ => Ok(Next::Done(ours.entry(self.path.clone()))),
-                }
-            }
-            WriteState::Discard { winner } => match (response.status, &self.precondition) {
-                (200 | 204 | 404, Precondition::None) if !winner.is_dir => Ok(self.upload(&winner)),
-                (200 | 204 | 404, Precondition::None) => Err(CloudError::Forbidden),
-                (200 | 204 | 404, _) => Err(CloudError::PreconditionFailed),
-                _ => Err(error_for(&response)),
-            },
-            WriteState::Uploading { mut upload } => match upload.receive(response)? {
-                Uploaded::Send(request) => {
-                    self.state = WriteState::Uploading { upload };
+            WriteState::Verify { ours, mut lookup } => match lookup.receive(&response).map_err(|_| CloudError::CommitUnconfirmed)? {
+                LookupResult::More(request) => {
+                    self.state = WriteState::Verify { ours, lookup };
                     Ok(Next::Request(request))
                 }
-                Uploaded::Done(ours) => Ok(self.uploaded(ours)),
-                // Deleted since the lookup, which also counts as "changed".
-                Uploaded::Failed(response) if response.status == 404 && matches!(self.precondition, Precondition::Matches(_)) => {
-                    Err(CloudError::PreconditionFailed)
+                // An empty result is the listing lagging behind the create.
+                LookupResult::Found(None, _) => Ok(Next::Done(ours.entry(self.path.clone()))),
+                LookupResult::Found(Some(item), _) if item.id == ours.id => Ok(Next::Done(ours.entry(self.path.clone()))),
+                LookupResult::Found(Some(_), _) => {
+                    self.state = WriteState::Discard;
+                    Ok(Next::Request(delete(&ours.id)))
                 }
-                Uploaded::Failed(response) => Err(error_for(&response)),
             },
-            WriteState::Revisions { ours, expected, mut ids } => {
-                if response.status != 200 {
-                    return Ok(Self::unverified(&ours, &self.path));
-                }
-                let json = json_body(&response)?;
-                let page = json.get("revisions").and_then(Value::as_array).ok_or(CloudError::InvalidResponse("revisions"))?;
-                ids.extend(page.iter().filter_map(|revision| revision.get("id").and_then(Value::as_str)).map(str::to_owned));
-                if let Some(token) = json.get("nextPageToken").and_then(Value::as_str).filter(|token| !token.is_empty()) {
-                    let request = revisions(&ours.id, Some(token));
-                    self.state = WriteState::Revisions { ours, expected, ids };
-                    return Ok(Next::Request(request));
-                }
-                let head = ours.revision.as_ref().map(Revision::as_str);
-                let previous =
-                    ids.iter().position(|id| Some(id.as_str()) == head).and_then(|index| index.checked_sub(1)).map(|index| &ids[index]);
-                match previous {
-                    Some(previous) if previous != expected.as_str() => {
-                        let request =
-                            download(file_url(API, &ours.id, &format!("/revisions/{}?alt=media", utf8_percent_encode(previous, ID))));
-                        self.state = WriteState::Restore { ours };
-                        Ok(Next::Request(request))
-                    }
-                    _ => Ok(Next::Done(ours.entry(self.path.clone()))),
-                }
-            }
-            WriteState::Restore { ours } => {
-                if response.status != 200 {
-                    return Err(CloudError::PreconditionFailed);
-                }
-                let mut upload = Upload::new(Target::Existing { id: ours.id }, response.body, self.chunk);
-                let request = upload.start();
-                self.state = WriteState::Restoring { upload };
-                Ok(Next::Request(request))
-            }
-            // Whether or not putting the other device's version back worked, this write lost the race.
-            WriteState::Restoring { mut upload } => match upload.receive(response) {
-                Ok(Uploaded::Send(request)) => {
-                    self.state = WriteState::Restoring { upload };
-                    Ok(Next::Request(request))
-                }
-                _ => Err(CloudError::PreconditionFailed),
-            },
+            // Deleted or not, the path resolves to the other device's file: the caller has to reconcile.
+            WriteState::Discard => Err(CloudError::CommitUnconfirmed),
         }
     }
 }
@@ -925,12 +534,14 @@ pub(crate) fn write(
     if path.is_root() {
         return Box::new(Ready::err(CloudError::InvalidPath));
     }
+    if !matches!(precondition, Precondition::None) {
+        return Box::new(Ready::err(CloudError::UnsupportedPrecondition));
+    }
     op(
-        Drive::of(connection).map(|drive| Write {
+        Drive::of(connection, config).map(|drive| Write {
             walk: drive.walk(&path, true),
             path,
             data: Zeroizing::new(data),
-            precondition,
             chunk: config.limits.chunk_size(CHUNK_UNIT, usize::MAX),
             state: WriteState::Walking,
         }),
@@ -944,8 +555,7 @@ pub(crate) fn write(
 enum CreateState {
     Walking,
     Creating { parent: Item },
-    Dedupe { ours: Item },
-    Discard,
+    Verify(Lookup),
 }
 
 struct CreateDir {
@@ -979,25 +589,27 @@ impl Steps for CreateDir {
                 if response.status != 200 {
                     return Err(error_for(&response));
                 }
-                let ours = Item::parse(&json_body(&response)?)?;
-                self.state = CreateState::Dedupe { ours };
-                Ok(Next::Request(lookup(&parent.id, name, true)))
+                let lookup = Lookup::new(&parent.id, name, false, self.walk.limit);
+                let request = lookup.page(None);
+                self.state = CreateState::Verify(lookup);
+                Ok(Next::Request(request))
             }
-            CreateState::Dedupe { ours } => match oldest_named(&response, name) {
-                Ok(Some(winner)) if response.status == 200 && winner.id != ours.id => {
-                    self.state = CreateState::Discard;
-                    Ok(Next::Request(delete(&ours.id)))
+            CreateState::Verify(mut lookup) => match lookup.receive(&response).map_err(|_| CloudError::CommitUnconfirmed)? {
+                LookupResult::More(request) => {
+                    self.state = CreateState::Verify(lookup);
+                    Ok(Next::Request(request))
                 }
-                _ => Ok(Next::Done(())),
+                // An empty result is the listing lagging behind the create.
+                LookupResult::Found(None, _) => Ok(Next::Done(())),
+                LookupResult::Found(Some(item), _) if item.is_dir => Ok(Next::Done(())),
+                LookupResult::Found(Some(_), _) => Err(CloudError::CommitUnconfirmed),
             },
-            // The folder exists either way; an orphaned duplicate is harmless.
-            CreateState::Discard => Ok(Next::Done(())),
         }
     }
 }
 
 pub(crate) fn create_dir(connection: &Connection, config: &ClientConfig, path: RemotePath) -> BoxOperation<()> {
-    match Drive::of(connection) {
+    match Drive::of(connection, config) {
         Ok(drive) if drive.is_drive_root(&path) => Box::new(Ready::ok(())),
         drive => op(drive.map(|drive| CreateDir { walk: drive.walk(&path, false), path, state: CreateState::Walking }), connection, config),
     }
@@ -1037,7 +649,7 @@ pub(crate) fn delete_path(connection: &Connection, config: &ClientConfig, path: 
     if path.is_root() {
         return Box::new(Ready::err(CloudError::InvalidPath));
     }
-    op(Drive::of(connection).map(|drive| Delete { walk: drive.walk(&path, false), deleting: false }), connection, config)
+    op(Drive::of(connection, config).map(|drive| Delete { walk: drive.walk(&path, false), deleting: false }), connection, config)
 }
 
 // MARK: - Moving
@@ -1051,23 +663,17 @@ enum RenameState {
         parent: Item,
     },
     Moving {
-        from_parent: Item,
         to_parent: Item,
     },
-    /// Looking the new name up again: names are not unique, so another device may have created it meanwhile.
-    Dedupe {
+    Verify {
         ours: Item,
-        from_parent: Item,
-        to_parent: Item,
+        lookup: Lookup,
     },
-    /// Another item with the name is older: moving ours back.
-    Undo,
 }
 
 struct Rename {
     from_walk: Walk,
     to_walk: Walk,
-    from: RemotePath,
     to: RemotePath,
     state: RenameState,
 }
@@ -1086,7 +692,7 @@ impl Steps for Rename {
     }
 
     fn next(&mut self, response: HttpResponse) -> Result<Next<Entry>, CloudError> {
-        match std::mem::replace(&mut self.state, RenameState::Undo) {
+        match std::mem::replace(&mut self.state, RenameState::From) {
             RenameState::From => match self.from_walk.receive(response)? {
                 Walked::Send(outgoing) => {
                     self.state = RenameState::From;
@@ -1110,45 +716,39 @@ impl Steps for Rename {
                 Walked::Found { item: None, parent: None } => Err(CloudError::NotFound),
                 Walked::Found { item: None, parent: Some(to_parent) } => {
                     let request = move_item(&item.id, Self::name(&self.to)?, &parent.id, &to_parent.id);
-                    self.state = RenameState::Moving { from_parent: parent, to_parent };
+                    self.state = RenameState::Moving { to_parent };
                     Ok(Next::Request(request))
                 }
             },
-            RenameState::Moving { from_parent, to_parent } => {
+            RenameState::Moving { to_parent } => {
                 if response.status != 200 {
                     return Err(error_for(&response));
                 }
-                let ours = Item::parse(&json_body(&response)?)?;
-                let request = lookup(&to_parent.id, Self::name(&self.to)?, false);
-                self.state = RenameState::Dedupe { ours, from_parent, to_parent };
+                let ours = json_body(&response).and_then(|json| Item::parse(&json)).map_err(|_| CloudError::CommitUnconfirmed)?;
+                let lookup = Lookup::new(&to_parent.id, Self::name(&self.to)?, false, self.to_walk.limit);
+                let request = lookup.page(None);
+                self.state = RenameState::Verify { ours, lookup };
                 Ok(Next::Request(request))
             }
-            RenameState::Dedupe { ours, from_parent, to_parent } => {
-                if response.status != 200 {
-                    return Ok(Next::Done(ours.entry(self.to.clone())));
+            RenameState::Verify { ours, mut lookup } => match lookup.receive(&response).map_err(|_| CloudError::CommitUnconfirmed)? {
+                LookupResult::More(request) => {
+                    self.state = RenameState::Verify { ours, lookup };
+                    Ok(Next::Request(request))
                 }
-                // The destination was free before the move, so any other item with the name was created concurrently.
-                // Age decides nothing here (the moved item keeps its old creation time), so the move always yields.
-                let name = Self::name(&self.to)?;
-                if files(&response)?.0.into_iter().any(|item| item.name == name && item.id != ours.id) {
-                    self.state = RenameState::Undo;
-                    Ok(Next::Request(move_item(&ours.id, Self::name(&self.from)?, &to_parent.id, &from_parent.id)))
-                } else {
-                    Ok(Next::Done(ours.entry(self.to.clone())))
-                }
-            }
-            // Moved back or not, another item owns the name.
-            RenameState::Undo => Err(CloudError::PreconditionFailed),
+                // An empty result is the listing lagging behind the move.
+                LookupResult::Found(None, _) => Ok(Next::Done(ours.entry(self.to.clone()))),
+                LookupResult::Found(Some(item), 1) if item.id == ours.id => Ok(Next::Done(ours.entry(self.to.clone()))),
+                LookupResult::Found(Some(_), _) => Err(CloudError::CommitUnconfirmed),
+            },
         }
     }
 }
 
 pub(crate) fn rename(connection: &Connection, config: &ClientConfig, from: RemotePath, to: RemotePath) -> BoxOperation<Entry> {
     op(
-        Drive::of(connection).map(|drive| Rename {
+        Drive::of(connection, config).map(|drive| Rename {
             from_walk: drive.walk(&from, false),
             to_walk: drive.walk(&to, false),
-            from,
             to,
             state: RenameState::From,
         }),
@@ -1246,8 +846,10 @@ mod tests {
                 {"id":"b","name":"data.bin","createdTime":"2026-10-02T00:00:00Z"}
             ]}"#,
         );
-        assert_eq!(oldest_named(&page, "data.bin").unwrap().map(|item| item.id), Some("b".to_owned()));
-        assert!(oldest_named(&page, "DATA.BIN").unwrap().is_none());
+        let mut lookup = Lookup::new("root", "data.bin", false, 10);
+        assert!(matches!(lookup.receive(&page).unwrap(), LookupResult::Found(Some(item), _) if item.id == "b"));
+        let mut lookup = Lookup::new("root", "DATA.BIN", false, 10);
+        assert!(matches!(lookup.receive(&page).unwrap(), LookupResult::Found(None, 0)));
         let url = url::Url::parse(&search_url("'root' in parents", 1, None)).unwrap();
         assert!(url.query_pairs().any(|(key, value)| key == "orderBy" && value == "createdTime"));
     }
@@ -1262,17 +864,5 @@ mod tests {
         assert_eq!(error(403, "insufficientFilePermissions"), CloudError::Forbidden);
         assert_eq!(error(404, "notFound"), CloudError::NotFound);
         assert_eq!(error(429, "rateLimitExceeded"), CloudError::RateLimited { retry_after: None });
-    }
-
-    #[test]
-    fn multipart_boundary_comes_from_the_content() {
-        let outgoing = create_file("parent", "data.bin", b"\x00content");
-        let content_type = outgoing.request.header("Content-Type").unwrap().to_owned();
-        let boundary = content_type.strip_prefix("multipart/related; boundary=").unwrap();
-        assert!(boundary.starts_with("cloudset-") && boundary.len() == "cloudset-".len() + 32);
-        let body = &outgoing.request.body;
-        assert!(body.starts_with(format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n").as_bytes()));
-        assert!(body.ends_with(format!("\x00content\r\n--{boundary}--\r\n").as_bytes()));
-        assert_ne!(create_file("parent", "data.bin", b"other").request.header("Content-Type"), Some(content_type.as_str()));
     }
 }

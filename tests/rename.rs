@@ -107,29 +107,17 @@ fn oauth_providers() {
 }
 
 #[test]
-fn google_drive_undoes_a_move_that_raced_a_create() {
-    let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
-    let mut client = sign_in(&mut server, cloudset::AccessScope::AppFolder, &config());
-    run(&mut server, &mut client, |c| c.write(path("a.txt"), b"mine".to_vec(), Precondition::Absent)).unwrap();
-    server.races().before_move = true;
-    let result = run(&mut server, &mut client, |c| c.rename(path("a.txt"), path("b.txt")));
-    assert_eq!(result.err(), Some(CloudError::PreconditionFailed));
-    let storage = |p: &str| server.storage_path(p);
-    assert_eq!(server.data(&storage("a.txt")).as_deref(), Some(&b"mine"[..]), "moved back");
-    assert_eq!(server.data(&storage("b.txt")).as_deref(), Some(&b"other device"[..]), "the other device keeps the name");
-    assert_eq!(server.copies(&storage("b.txt")), 1);
-}
-
-#[test]
-fn google_drive_yields_to_a_newer_concurrent_create() {
-    let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
-    let mut client = sign_in(&mut server, cloudset::AccessScope::AppFolder, &config());
-    run(&mut server, &mut client, |c| c.write(path("a.txt"), b"mine".to_vec(), Precondition::Absent)).unwrap();
-    server.races().after_move = true;
-    let result = run(&mut server, &mut client, |c| c.rename(path("a.txt"), path("b.txt")));
-    assert_eq!(result.err(), Some(CloudError::PreconditionFailed), "the older moved item must not hide the new file");
-    let storage = |p: &str| server.storage_path(p);
-    assert_eq!(server.data(&storage("a.txt")).as_deref(), Some(&b"mine"[..]), "moved back");
-    assert_eq!(server.data(&storage("b.txt")).as_deref(), Some(&b"other device"[..]));
-    assert_eq!(server.copies(&storage("b.txt")), 1);
+fn google_drive_reports_ambiguous_moves_without_another_mutation() {
+    for after_move in [false, true] {
+        let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
+        let mut client = sign_in(&mut server, cloudset::AccessScope::AppFolder, &config());
+        run(&mut server, &mut client, |c| c.write(path("a.txt"), b"mine".to_vec(), Precondition::None)).unwrap();
+        server.races().before_move = !after_move;
+        server.races().after_move = after_move;
+        let before = server.requests.len();
+        let result = run(&mut server, &mut client, |c| c.rename(path("a.txt"), path("b.txt")));
+        assert_eq!(result.err(), Some(CloudError::CommitUnconfirmed));
+        assert_eq!(server.copies(&server.storage_path("b.txt")), 2);
+        assert_eq!(server.requests[before..].iter().filter(|r| r.method == cloudset::Method::Patch).count(), 1);
+    }
 }

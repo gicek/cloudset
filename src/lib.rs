@@ -14,8 +14,9 @@
 //!   [`write`](Client::write), [`create_dir`](Client::create_dir), [`rename`](Client::rename),
 //!   [`delete`](Client::delete), [`revoke`](Client::revoke)) into an [`Operation`].
 //! - [`Operation::advance`] returns [`Step::Send`] with an [`HttpRequest`] to execute, or [`Step::Done`] with the result.
-//!   When [`Done::connection`] is set, the connection changed (a refreshed token): store the new one.
-//! - [`run`] drives an operation with a transport function that cannot fail, such as an in-memory test server.
+//!   Persist [`Operation::take_connection`] after each advance and any outstanding [`Done::connection`] on completion.
+//! - [`run`] drives an operation with a transport function that cannot fail, such as an in-memory test server;
+//!   [`run_with_updates`] also hands over connection updates as they happen.
 //!
 //! # Example
 //!
@@ -76,5 +77,5 @@ pub use entry::{Entry, File, Precondition, Revision};
 pub use error::CloudError;
 pub use http::{HttpRequest, HttpResponse, Limits, Method};
 pub use oauth::{Authorization, DropboxAppRequest, OAuthClient};
-pub use operation::{BoxOperation, Done, Operation, Progress, Step, Subtask, map, run};
+pub use operation::{BoxOperation, Done, Operation, Progress, Step, Subtask, map, run, run_with_updates};
 pub use path::RemotePath;

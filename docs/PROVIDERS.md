@@ -10,22 +10,24 @@ is for when you need to know exactly what goes over the wire.
 | Sign-in | User name and password, or Nextcloud Login Flow v2 | OAuth 2.0 + PKCE | OAuth 2.0 + PKCE | OAuth 2.0 + PKCE |
 | Access scopes | `Full` | `AppFolder`, `Full` | `AppFolder`, `Full` | `AppFolder`, `Full` |
 | Version (`Revision`) | `getetag` from `PROPFIND` | `rev` | `eTag` | `headRevisionId` |
-| Conditional writes | `If-Match` / `If-None-Match: *` | Upload `mode` | `If-Match` / `conflictBehavior=fail` | Emulated |
+| Conditional writes | Strong ETag for `Matches`; `If-None-Match: *` for `Absent` | Upload `mode` | `Matches` for single-request uploads only; `Absent` uses `conflictBehavior=fail` | Both strict conditions return `UnsupportedPrecondition` |
 | Large uploads | One `PUT` | Upload session | Upload session | Resumable upload |
 | Move or rename | `MOVE`, `Overwrite: F` | `files/move_v2` | `PATCH` with `parentReference` | `PATCH` with `addParents` / `removeParents` |
 | Missing parent on write | `NotFound` | Created | Created | Created |
 | `revoke` | Nextcloud deletes the app password; WebDAV does nothing | Revokes the token | Nothing (no endpoint) | Revokes the whole grant |
 
-Every provider: `rename` requires the destination's parent to exist and the destination to be free; it never overwrites.
+Every provider: `rename` requires the destination's parent to exist and the destination to be free; on Google Drive a
+race may leave the move unconfirmed.
 
 ## WebDAV and Nextcloud
 
 - **Versions** always come from `getetag` in `PROPFIND`. The `ETag` header of `GET` and `PUT` responses is ignored,
   because servers do not always write it the same way.
-- **Reads** are `PROPFIND`, then `GET` with `If-Match`, retried up to three times if the file changes in between.
-- **Writes** are a conditional `PUT`, then `PROPFIND` for the new version. `Precondition::Absent` sends
-  `If-None-Match: *`; `Matches` sends `If-Match`. A weak ETag (`W/"…"`) cannot be compared strongly, so cloudset compares
-  the version before writing instead, which leaves a short race window.
+- **Reads** bind metadata to the body with a strong ETag and conditional GET. Without a strong ETag, content is
+  returned with its actual length and without a revision or modification time.
+- **Writes** send the precondition with PUT. Weak or malformed ETags cannot authorize a replacement. For payloads
+  within the read budget, the client checks the remote content before handing a revision to the caller. A committed
+  write whose verification fails reports `CommitUnconfirmed`. Larger writes return an acknowledgement without a revision.
 - **Directories**: `MKCOL`. A 405 response means "already exists" in RFC 4918, but some servers also send it when
   permission is denied, so cloudset checks with `PROPFIND` before treating it as success.
 - **Moves**: `MOVE` with `Destination` and `Overwrite: F`. A 412 response (destination exists) is `PreconditionFailed`;
@@ -34,14 +36,22 @@ Every provider: `rename` requires the destination's parent to exist and the dest
 - **Pinned certificates** are only allowed when every address of the connection is `https://`.
 - **Untrusted XML**: a `DOCTYPE` is rejected, custom entities are not expanded, and nesting depth and entry counts are
   capped. An `href` outside the root, or containing `..` or control characters, is dropped.
+- **Listings** must contain the directory itself; otherwise the server's paths do not map onto the endpoint and the
+  listing is an `InvalidResponse`, not an empty directory. Only direct children are returned.
+- **Redirects** are followed on the same origin (or from HTTP to HTTPS on the same host), keeping the method. A `303`
+  is only followed for `GET`.
 - **Nextcloud Login Flow v2**: the poll endpoint, the login page and the returned server address must share the origin
-  the user entered (an upgrade from HTTP to HTTPS on the same host is allowed).
+  the user entered (an upgrade from HTTP to HTTPS on the same host is allowed, and the HTTPS address is then used for
+  the connection). Files are addressed under `remote.php/dav/files/<user ID>/`; if the user ID cannot be looked up
+  after the app password was issued, the connection uses `remote.php/webdav/`.
 
 ## OAuth providers
 
 - `oauth::begin(provider, access, client, &random)` derives the PKCE verifier and `state` from 64 random bytes you take
   from a CSPRNG. Open `Authorization::url()` in the system authentication session and pass the callback URL to
-  `complete`, which checks the URL and `state` (in constant time) before it sends anything. There is no client secret.
+  `complete`, which checks the URL and `state` (in constant time) before it sends anything. A callback on a loopback
+  address must match the port too. Only Google "Desktop app" clients have a client secret; it is sent in the body of the
+  code exchange and of every refresh.
 - Tokens refresh shortly before they expire (60 seconds early, when `ClientConfig::now` is set) or after a 401, and the
   request is replayed once. A second 401 is `ReauthRequired`.
 - Requests that carry the access token only go to the provider's API origin. Pre-signed URLs (OneDrive downloads and
@@ -76,10 +86,17 @@ Every provider: `rename` requires the destination's parent to exist and the dest
   addressed by path. The version is `eTag`.
 - Reads download the pre-signed `downloadUrl` without credentials, then check the `eTag` again (retried up to three
   times).
-- Writes up to the chunk size are one `PUT …:/content`. Larger files use `createUploadSession` with the same `If-Match`
-  and `conflictBehavior`, then chunks (multiples of 320 KiB, at most 60 MiB) sent to the session's pre-signed URL.
-  Graph checks `If-Match` when the session is created, not when it completes, so a write by someone else during a
-  chunked upload is overwritten. Raise `Limits::upload_chunk_bytes` above your file sizes if that window matters.
+- Small writes use PUT. Larger writes use an upload session with fragments aligned to 320 KiB and strictly below
+  60 MiB. A session cannot protect `Matches` through commit, so Cloudset rejects that condition before upload.
+- `Matches` sends the `eTag` as it was returned, quoted or bare; a wildcard, a weak tag or a list is refused before
+  upload. Graph honors `If-Match` on `PUT …:/content` (412) although only the upload session page documents the
+  header. For a file that no longer exists it ignores the header and creates the file; cloudset deletes that file
+  again, that version only, and reports `PreconditionFailed`.
+- Folders are created with `POST …/items/<parent ID>/children` after looking the parent up: in the app folder Graph
+  refuses the same request addressed by path.
+- Graph answers 501 `notSupported` to content written onto a folder, 422 `notSupported` to the children of a file,
+  and 400 `invalidRequest` to a move whose source is missing as well as to an invalid name; cloudset tells the last
+  two apart by looking at the source.
 - Moves look up the destination folder's ID, then `PATCH` the item with `parentReference`, the new name and
   `conflictBehavior=fail`.
 - Microsoft has no revocation endpoint: `revoke` succeeds without a request, and the user removes the app under "App
@@ -91,14 +108,15 @@ Every provider: `rename` requires the destination's parent to exist and the dest
   (intermediate segments match folders only). Among items with the same name, the oldest (creation time, then ID) always
   wins, in listings too.
 - The version is `headRevisionId`. Reads download `alt=media` and check the version again (retried up to three times).
-- Drive v3 has no conditional writes, so cloudset emulates them:
-  - `Matches(rev)` compares the head revision before uploading and lists the revisions afterwards. If another writer got
-    in between, its revision is uploaded again on top and the write reports `PreconditionFailed`, so no write is
-    silently lost.
-  - `Absent` looks the name up again after creating; of two concurrent files, the newer one is deleted by its writer.
+- Path-based creation and revision replacement cannot enforce atomic preconditions here. Both `Absent` and `Matches`
+  return `UnsupportedPrecondition` before any network request. Use an application-specific conflict workflow or
+  explicitly request an unconditional write. Historical revisions are never replayed as conflict compensation.
 - New files up to 5 MiB are one `multipart/related` upload; larger files and revisions use a resumable upload session
   (chunks of a multiple of 256 KiB). Either way the file appears only when all of it has arrived.
-- Moves resolve both paths, `PATCH` the item's name and parents, then look the name up again. If any other item with
-  the same name turned up meanwhile, the move is undone and reports `PreconditionFailed` (the moved item keeps its old
-  creation time, so age cannot decide). At worst both writers report a conflict; no data is hidden.
+- Creating a file or folder looks the name up again afterwards. A listing that does not show the new item yet counts
+  as success. If an older file with the same name turned up, the file just created is deleted and the write reports
+  `CommitUnconfirmed`: the path now resolves to the other device's file. A duplicate folder is left alone, because
+  another device may already be writing into it, and the oldest one is used.
+- A move checks the destination before and after changing the item. If another item with the name turned up, both stay
+  and the move reports `CommitUnconfirmed`; inspect both paths.
 - `revoke` revokes the refresh token, which ends the whole grant.

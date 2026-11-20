@@ -7,8 +7,8 @@
 //! The version is the item's `eTag`. Reading downloads from `@microsoft.graph.downloadUrl` in the metadata (a pre-signed
 //! HTTPS URL without credentials), then fetches the metadata again to check the `eTag`, retrying if it changed in between
 //! (at most 3 times). Writing uploads small files with `PUT …:/content`, using `If-Match` (412 on a version mismatch) or
-//! `conflictBehavior=fail` (409 if it already exists). Larger files go through an upload session with the same
-//! conditions: `createUploadSession`, then chunks `PUT` to its pre-signed upload URL without credentials.
+//! `conflictBehavior=fail` (409 if it already exists). Larger uploads send chunks to a pre-signed session URL.
+//! A session cannot enforce a matching revision at commit; these writes report `UnsupportedPrecondition` before opening it.
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
@@ -89,6 +89,15 @@ fn error_for(response: &HttpResponse) -> CloudError {
     }
 }
 
+/// The error for a pre-signed download or upload URL. It carries no token, so a refusal says nothing about the
+/// sign-in or the user's permissions, and a 400 nothing about the path.
+fn presigned_error(response: &HttpResponse) -> CloudError {
+    match response.status {
+        400 | 401 | 403 => CloudError::Server { status: response.status },
+        _ => error_for(response),
+    }
+}
+
 fn entry(item: &Value, path: RemotePath) -> Entry {
     Entry {
         path,
@@ -148,6 +157,10 @@ impl Steps for List {
     }
 
     fn next(&mut self, response: HttpResponse) -> Result<Next<Vec<Entry>>, CloudError> {
+        if response.status == 422 && error_code(&response) == "notSupported" {
+            // Children of a file.
+            return Err(CloudError::NotFound);
+        }
         if response.status != 200 {
             return Err(error_for(&response));
         }
@@ -234,7 +247,7 @@ impl Steps for Read {
                     Ok(Next::Request(get(format!("{}?{SELECT}", self.drive.url(&self.path, "")))))
                 }
                 404 => Ok(Next::Done(None)),
-                _ => Err(status_error(&response)),
+                _ => Err(presigned_error(&response)),
             },
             ReadState::Verify(entry, data) => {
                 match response.status {
@@ -265,9 +278,10 @@ pub(crate) fn read(connection: &Connection, config: &ClientConfig, path: RemoteP
 
 // MARK: - Writing
 
-/// Upload session chunks must be multiples of 320 KiB and at most 60 MiB.
+/// Upload session chunks must be multiples of 320 KiB and strictly smaller than 60 MiB.
 const CHUNK_UNIT: usize = 320 * 1024;
-const MAX_CHUNK: usize = 60 * 1024 * 1024;
+const MAX_CHUNK: usize = 60 * 1024 * 1024 - CHUNK_UNIT;
+const MAX_SIMPLE_UPLOAD: usize = 250_000_000;
 
 enum WriteState {
     Start,
@@ -279,6 +293,8 @@ enum WriteState {
     Uploading {
         url: String,
     },
+    /// `If-Match` was ignored because there was no file, and one was created: deleting it again.
+    Discard,
 }
 
 struct Write {
@@ -287,6 +303,7 @@ struct Write {
     data: Zeroizing<Vec<u8>>,
     precondition: Precondition,
     chunk: usize,
+    simple_limit: usize,
     offset: usize,
     state: WriteState,
 }
@@ -316,11 +333,30 @@ impl Write {
         Outgoing::anonymous(request)
     }
 
-    fn written(&self, response: &HttpResponse) -> Result<Next<Entry>, CloudError> {
+    fn written(&mut self, response: &HttpResponse, presigned: bool) -> Result<Next<Entry>, CloudError> {
         match response.status {
-            200 | 201 => Ok(Next::Done(entry(&json_body(response)?, self.path.clone()))),
+            // Graph ignores `If-Match` when the file is gone and creates it. The file that was to be replaced no
+            // longer exists, so the write failed its condition: take the new file away again, that exact version only.
+            201 if matches!(self.precondition, Precondition::Matches(_)) => {
+                let item = json_body(response).map_err(|_| CloudError::CommitUnconfirmed)?;
+                let id = item.get("id").and_then(Value::as_str).ok_or(CloudError::CommitUnconfirmed)?;
+                let tag = item.get("eTag").and_then(Value::as_str).map(Revision::new).filter(Revision::is_single_match_tag);
+                let tag = tag.ok_or(CloudError::CommitUnconfirmed)?;
+                let url = format!("{GRAPH}/items/{}", utf8_percent_encode(id, SEGMENT));
+                self.state = WriteState::Discard;
+                Ok(Next::Request(Outgoing::authorized(json_request(Method::Delete, &url, None).with_header("If-Match", tag.as_str()))))
+            }
+            // A folder is in the way.
+            501 if !presigned && error_code(response) == "notSupported" => Err(match self.precondition {
+                Precondition::Absent => CloudError::PreconditionFailed,
+                _ => CloudError::Forbidden,
+            }),
+            200 | 201 => {
+                json_body(response).map(|item| Next::Done(entry(&item, self.path.clone()))).map_err(|_| CloudError::CommitUnconfirmed)
+            }
             // With If-Match, the file no longer exists: it was deleted since the last read, which also counts as "changed".
             404 if matches!(self.precondition, Precondition::Matches(_)) => Err(CloudError::PreconditionFailed),
+            _ if presigned => Err(presigned_error(response)),
             _ => Err(error_for(response)),
         }
     }
@@ -333,7 +369,7 @@ impl Steps for Write {
         if !matches!(self.state, WriteState::Start) {
             return Err(CloudError::OutOfOrder);
         }
-        if self.data.len() <= self.chunk {
+        if self.data.len() <= self.simple_limit {
             let url = format!("{}?@microsoft.graph.conflictBehavior={}", self.drive.url(&self.path, "content"), self.behavior());
             let request =
                 HttpRequest::new(Method::Put, url).with_header("Content-Type", "application/octet-stream").with_body(self.data.to_vec());
@@ -348,14 +384,14 @@ impl Steps for Write {
 
     fn next(&mut self, response: HttpResponse) -> Result<Next<Entry>, CloudError> {
         match std::mem::replace(&mut self.state, WriteState::Start) {
-            WriteState::Simple => self.written(&response),
+            WriteState::Simple => self.written(&response, false),
             WriteState::Session => match response.status {
                 200 => {
                     let json = json_body(&response)?;
                     let url = json.get("uploadUrl").and_then(Value::as_str).ok_or(CloudError::InvalidResponse("upload url"))?;
                     Ok(Next::Request(self.chunk_request(url.to_owned())))
                 }
-                _ => self.written(&response),
+                _ => self.written(&response, false),
             },
             WriteState::Uploading { url } => match response.status {
                 202 => {
@@ -374,10 +410,26 @@ impl Steps for Write {
                 }
                 // The session expired or was removed.
                 404 => Err(CloudError::InvalidResponse("upload session")),
-                _ => self.written(&response),
+                _ => self.written(&response, true),
+            },
+            // Gone again, or someone already replaced or removed it: either way the condition did not hold.
+            WriteState::Discard => match response.status {
+                200 | 204 | 404 | 412 => Err(CloudError::PreconditionFailed),
+                _ => Err(CloudError::CommitUnconfirmed),
             },
             WriteState::Start => Err(CloudError::OutOfOrder),
         }
+    }
+}
+
+fn simple_upload_limit(config: &ClientConfig) -> usize {
+    config.limits.upload_chunk_bytes.clamp(CHUNK_UNIT, MAX_SIMPLE_UPLOAD)
+}
+
+pub(crate) fn supports_write_precondition(config: &ClientConfig, size: usize, precondition: &Precondition) -> bool {
+    match precondition {
+        Precondition::Matches(revision) => size <= simple_upload_limit(config) && revision.is_single_match_tag(),
+        _ => true,
     }
 }
 
@@ -392,6 +444,10 @@ pub(crate) fn write(
         return Box::new(Ready::err(CloudError::InvalidPath));
     }
     let chunk = config.limits.chunk_size(CHUNK_UNIT, MAX_CHUNK);
+    let simple_limit = simple_upload_limit(config);
+    if !supports_write_precondition(config, data.len(), &precondition) {
+        return Box::new(Ready::err(CloudError::UnsupportedPrecondition));
+    }
     op(
         Drive::of(connection).map(|drive| Write {
             drive,
@@ -399,6 +455,7 @@ pub(crate) fn write(
             data: Zeroizing::new(data),
             precondition,
             chunk,
+            simple_limit,
             offset: 0,
             state: WriteState::Start,
         }),
@@ -413,6 +470,8 @@ enum RenameState {
     /// Looking up the destination's parent folder for its ID.
     Parent,
     Moving,
+    /// The move was refused as an invalid request, which is also what a missing source gets: looking at the source.
+    Source,
 }
 
 struct Rename {
@@ -451,6 +510,15 @@ impl Steps for Rename {
             }
             RenameState::Moving => match response.status {
                 200 => Ok(Next::Done(entry(&json_body(&response)?, self.to.clone()))),
+                400 if error_code(&response) == "invalidRequest" => {
+                    self.state = RenameState::Source;
+                    Ok(Next::Request(get(format!("{}?$select=id", self.drive.url(&self.from, "")))))
+                }
+                _ => Err(error_for(&response)),
+            },
+            RenameState::Source => match response.status {
+                404 => Err(CloudError::NotFound),
+                200 => Err(CloudError::InvalidPath),
                 _ => Err(error_for(&response)),
             },
         }
@@ -464,6 +532,8 @@ pub(crate) fn rename(connection: &Connection, config: &ClientConfig, from: Remot
 // MARK: - Directories and deletion
 
 enum CreateState {
+    /// Looking up the parent folder for its ID: the app folder takes new children by ID only, not by path.
+    Parent,
     Create,
     /// The name is taken: succeed only if the existing item is a folder.
     Check,
@@ -480,13 +550,28 @@ impl Steps for CreateDir {
 
     fn first(&mut self) -> Result<Outgoing, CloudError> {
         let parent = self.path.parent().unwrap_or_else(RemotePath::root);
-        let name = self.path.name().ok_or(CloudError::InvalidPath)?;
-        let body = json!({ "name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail" });
-        Ok(Outgoing::authorized(json_request(Method::Post, &self.drive.url(&parent, "children"), Some(&body))))
+        Ok(get(format!("{}?$select=id,folder", self.drive.url(&parent, ""))))
     }
 
     fn next(&mut self, response: HttpResponse) -> Result<Next<()>, CloudError> {
         match self.state {
+            CreateState::Parent => {
+                match response.status {
+                    200 => {}
+                    404 => return Err(CloudError::NotFound),
+                    _ => return Err(error_for(&response)),
+                }
+                let parent = json_body(&response)?;
+                if parent.get("folder").is_none() {
+                    return Err(CloudError::NotFound);
+                }
+                let id = parent.get("id").and_then(Value::as_str).ok_or(CloudError::InvalidResponse("item id"))?;
+                let name = self.path.name().ok_or(CloudError::InvalidPath)?;
+                let body = json!({ "name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail" });
+                let url = format!("{GRAPH}/items/{}/children", utf8_percent_encode(id, SEGMENT));
+                self.state = CreateState::Create;
+                Ok(Next::Request(Outgoing::authorized(json_request(Method::Post, &url, Some(&body)))))
+            }
             CreateState::Create => match response.status {
                 200 | 201 => Ok(Next::Done(())),
                 409 => {
@@ -508,7 +593,7 @@ pub(crate) fn create_dir(connection: &Connection, config: &ClientConfig, path: R
     if path.is_root() {
         return Box::new(Ready::ok(()));
     }
-    op(Drive::of(connection).map(|drive| CreateDir { drive, path, state: CreateState::Create }), connection, config)
+    op(Drive::of(connection).map(|drive| CreateDir { drive, path, state: CreateState::Parent }), connection, config)
 }
 
 struct Delete {

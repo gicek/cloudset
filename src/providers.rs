@@ -94,7 +94,13 @@ pub(crate) fn parse_utc(text: &str) -> Option<SystemTime> {
     let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
     let second: i64 = whole.parse().ok()?;
     let nanos: u32 = if fraction.is_empty() { 0 } else { format!("{fraction:0<9}").get(..9)?.parse().ok()? };
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    let valid = (1970..=9999).contains(&year)
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && (0..=23).contains(&hour)
+        && (0..=59).contains(&minute)
+        && (0..=60).contains(&second);
+    if !valid {
         return None;
     }
     // Howard Hinnant's days_from_civil
@@ -106,7 +112,7 @@ pub(crate) fn parse_utc(text: &str) -> Option<SystemTime> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     let secs = u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()?;
-    Some(UNIX_EPOCH + Duration::new(secs, nanos))
+    UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
 }
 
 #[cfg(test)]
@@ -118,6 +124,16 @@ mod tests {
         assert_eq!(parse_utc("1970-01-01T00:00:00Z"), Some(UNIX_EPOCH));
         assert_eq!(parse_utc("2026-10-28T09:12:40Z"), Some(UNIX_EPOCH + Duration::from_secs(1_793_178_760)));
         assert_eq!(parse_utc("2024-02-29T12:00:00.5Z"), Some(UNIX_EPOCH + Duration::new(1_709_208_000, 500_000_000)));
+        let out_of_range = [
+            "9223372036854775807-03-01T00:00:00Z",
+            "292277026597-01-01T00:00:00Z",
+            "99999-01-01T00:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "2026-01-01T-5:-7:-9Z",
+        ];
+        for bad in out_of_range {
+            assert_eq!(parse_utc(bad), None, "{bad}");
+        }
         for bad in ["2026-10-28T09:12:40", "2026-13-01T00:00:00Z", "yesterday", "2026-10-28 09:12:40Z"] {
             assert_eq!(parse_utc(bad), None, "{bad}");
         }

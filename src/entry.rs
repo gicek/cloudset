@@ -18,10 +18,25 @@ impl Revision {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+    /// RFC 9110 entity-tag syntax. In particular, the wildcard and validator lists must never
+    /// turn a version-specific If-Match into a broader condition.
+    pub(crate) fn is_strong_etag(&self) -> bool {
+        let tag = self.as_str().as_bytes();
+        tag.len() >= 2
+            && tag.first() == Some(&b'"')
+            && tag.last() == Some(&b'"')
+            && tag[1..tag.len() - 1].iter().all(|&b| b == 0x21 || (0x23..=0x7e).contains(&b) || b >= 0x80)
+    }
 
-    /// A weak ETag (`W/"…"`) cannot be used for the strong comparison of conditional requests.
-    pub(crate) fn is_weak(&self) -> bool {
-        self.0.starts_with("W/")
+    /// A tag that names exactly one version in `If-Match`: a strong entity-tag, or a bare token as Microsoft Graph
+    /// returns for personal accounts (`aRDQ2…`). The wildcard, weak tags and lists are refused.
+    pub(crate) fn is_single_match_tag(&self) -> bool {
+        let tag = self.as_str().as_bytes();
+        self.is_strong_etag()
+            || (!tag.is_empty()
+                && tag != b"*"
+                && !tag.starts_with(b"W/")
+                && tag.iter().all(|&b| b == 0x21 || ((0x23..=0x7e).contains(&b) && b != b',') || b >= 0x80))
     }
 }
 
@@ -68,4 +83,22 @@ pub enum Precondition {
     Absent,
     /// Overwrite only if the remote version is still this one.
     Matches(Revision),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_tags_name_exactly_one_version() {
+        for strong in ["\"abc\"", "\"{F2B9A0AE-0AB8},4\"", "\"\""] {
+            assert!(Revision::new(strong).is_strong_etag() && Revision::new(strong).is_single_match_tag(), "{strong}");
+        }
+        for bare in ["aRDQ2NDhGMDZDOTFEOUQzRCE1NDkyNy4w", "0B4dataRevAAA"] {
+            assert!(!Revision::new(bare).is_strong_etag() && Revision::new(bare).is_single_match_tag(), "{bare}");
+        }
+        for refused in ["", "*", "W/\"abc\"", "\"a\", \"b\"", "a,b", "a b", "a\"b", "a\r\nX-Injected: 1"] {
+            assert!(!Revision::new(refused).is_strong_etag() && !Revision::new(refused).is_single_match_tag(), "{refused:?}");
+        }
+    }
 }

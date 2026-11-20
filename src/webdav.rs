@@ -1,12 +1,11 @@
 //! WebDAV (RFC 4918). Nextcloud also goes through here after sign-in.
 //!
-//! Versions always come from `getetag` in `PROPFIND`: on some servers the ETag in `GET` / `PUT` response headers is not
-//! written the same way as `getetag`, and mixing them makes the caller think the remote changed when it did not. So a
-//! read is "PROPFIND for the version -> GET with `If-Match`" (retried if the file changes in between), and a write is
-//! "conditional PUT -> PROPFIND for the new version". Weak ETags cannot be used in conditional requests, so those fall
-//! back to comparing before writing (with a brief race window).
+//! Strong `getetag` values bind a GET to its PROPFIND metadata. A write obtains its revision by
+//! reading back the committed bytes. Reads without a strong validator return only metadata known
+//! from the GET itself; weak validators cannot authorize conditional overwrites.
 
 use percent_encoding::percent_decode_str;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::client::ClientConfig;
@@ -71,9 +70,11 @@ impl Dav {
         RemotePath::from_segments(rest.iter().cloned()).ok()
     }
 
-    fn entries(&self, response: &HttpResponse) -> Result<Vec<Entry>, CloudError> {
-        let entries = multistatus::parse(&response.body, self.config.limits.max_entries)?;
-        Ok(entries.into_iter().filter_map(|entry| self.entry(entry)).collect())
+    /// The entries of a multistatus, and the paths it reports as missing (a 404 status of their own).
+    fn entries(&self, response: &HttpResponse) -> Result<(Vec<Entry>, Vec<RemotePath>), CloudError> {
+        let parsed = multistatus::parse(&response.body, self.config.limits.max_entries)?;
+        let missing = parsed.missing.iter().filter_map(|href| self.path_of(href)).collect();
+        Ok((parsed.entries.into_iter().filter_map(|entry| self.entry(entry)).collect(), missing))
     }
 
     fn entry(&self, dav: DavEntry) -> Option<Entry> {
@@ -89,12 +90,15 @@ impl Dav {
     /// Final response of `PROPFIND Depth: 0` -> the entry at that path; 404 yields `None`.
     fn stat_result(&self, path: &RemotePath, response: &HttpResponse) -> Result<Option<Entry>, CloudError> {
         match response.status {
-            207 => self
-                .entries(response)?
-                .into_iter()
-                .find(|entry| &entry.path == path)
-                .map(Some)
-                .ok_or(CloudError::InvalidResponse("missing entry")),
+            207 => {
+                let (entries, missing) = self.entries(response)?;
+                match entries.into_iter().find(|entry| &entry.path == path) {
+                    Some(entry) => Ok(Some(entry)),
+                    // The multistatus names the path with a 404 of its own.
+                    None if missing.iter().any(|missing| missing == path) => Ok(None),
+                    None => Err(CloudError::InvalidResponse("missing entry")),
+                }
+            }
             404 => Ok(None),
             _ => Err(status_error(response)),
         }
@@ -117,7 +121,17 @@ impl Dav {
         let dav = self.clone();
         Box::new(Single::new(call, move |response| match response.status {
             207 => {
-                let mut entries: Vec<Entry> = dav.entries(&response)?.into_iter().filter(|entry| entry.path != dir).collect();
+                let (entries, missing) = dav.entries(&response)?;
+                // The directory itself is always part of the answer. Without it the hrefs do not map onto this
+                // endpoint (a rewriting proxy, say), and an empty listing would read as "no files".
+                match entries.iter().find(|entry| entry.path == dir) {
+                    Some(entry) if entry.is_dir => {}
+                    Some(_) => return Err(CloudError::InvalidResponse("not a directory")),
+                    None if missing.contains(&dir) => return Err(CloudError::NotFound),
+                    None => return Err(CloudError::InvalidResponse("missing entry")),
+                }
+                // Direct children only, also from a server that ignores `Depth: 1`.
+                let mut entries: Vec<Entry> = entries.into_iter().filter(|entry| entry.path.parent().as_ref() == Some(&dir)).collect();
                 entries.sort_by(|a, b| a.path.cmp(&b.path));
                 Ok(entries)
             }
@@ -145,7 +159,10 @@ impl Dav {
     }
 
     pub(crate) fn write(&self, path: RemotePath, data: Vec<u8>, precondition: Precondition) -> BoxOperation<Entry> {
-        Box::new(Write { dav: self.clone(), path, data: Some(data), precondition, state: WriteState::Start })
+        if path.is_root() {
+            return Box::new(Ready::err(CloudError::InvalidPath));
+        }
+        Box::new(Write { dav: self.clone(), path, state: WriteState::Start(data, precondition) })
     }
 
     pub(crate) fn rename(&self, from: RemotePath, to: RemotePath) -> BoxOperation<Entry> {
@@ -263,7 +280,7 @@ impl Operation for Read {
                         return Err(CloudError::InvalidResponse("expected a file"));
                     }
                     let mut headers = Vec::new();
-                    if let Some(revision) = entry.revision.as_ref().filter(|revision| !revision.is_weak()) {
+                    if let Some(revision) = entry.revision.as_ref().filter(|revision| revision.is_strong_etag()) {
                         headers.push(("If-Match".into(), revision.as_str().to_owned()));
                     }
                     let mut call = self.dav.call(self.dav.request(Method::Get, &self.path, false, headers, Vec::new())?);
@@ -278,7 +295,14 @@ impl Operation for Read {
                     Ok(Step::Send(request))
                 }
                 CallStep::Response(response) => match response.status {
-                    200 => Ok(Step::Done(Done::new(Some(File { data: response.body, entry })))),
+                    200 => {
+                        let entry = if entry.revision.as_ref().is_some_and(Revision::is_strong_etag) {
+                            entry
+                        } else {
+                            content_entry(self.path.clone(), response.body.len())
+                        };
+                        Ok(Step::Done(Done::new(Some(File { data: response.body, entry }))))
+                    }
                     404 => Ok(Step::Done(Done::new(None))),
                     412 if self.attempts < READ_ATTEMPTS => self.start_stat(),
                     _ => Err(status_error(&response)),
@@ -289,38 +313,45 @@ impl Operation for Read {
     }
 }
 
+fn content_entry(path: RemotePath, size: usize) -> Entry {
+    Entry { path, size: Some(size as u64), is_dir: false, modified_at: None, revision: None }
+}
+
 enum WriteState {
-    Start,
-    /// Weak ETag: compare the version first, then write unconditionally.
-    Check(Call),
-    Put(Call),
-    Stat(Call),
+    Start(Vec<u8>, Precondition),
+    Put { call: Call, size: usize, digest: Option<[u8; 32]> },
+    Verify { read: BoxOperation<Option<File>>, digest: [u8; 32] },
     Finished,
 }
 
 struct Write {
     dav: Dav,
     path: RemotePath,
-    data: Option<Vec<u8>>,
-    precondition: Precondition,
     state: WriteState,
 }
 
 impl Write {
-    fn start_put(&mut self, conditional: bool) -> Result<Step<Entry>, CloudError> {
-        let mut headers = vec![("Content-Type".into(), "application/octet-stream".into())];
-        if conditional {
-            match &self.precondition {
-                Precondition::None => {}
-                Precondition::Absent => headers.push(("If-None-Match".into(), "*".into())),
-                Precondition::Matches(revision) => headers.push(("If-Match".into(), revision.as_str().to_owned())),
+    fn verify(
+        &mut self,
+        mut read: BoxOperation<Option<File>>,
+        digest: [u8; 32],
+        response: Option<HttpResponse>,
+    ) -> Result<Step<Entry>, CloudError> {
+        // The PUT is already acknowledged. Whatever stops the read-back (rate limit, expired sign-in, a changed file),
+        // reporting it as its own error would read as "nothing was written" and invite a blind retry.
+        match read.advance(response).map_err(|_| CloudError::CommitUnconfirmed)? {
+            Step::Send(request) => {
+                self.state = WriteState::Verify { read, digest };
+                Ok(Step::Send(request))
+            }
+            Step::Done(done) => {
+                let file = done.value.ok_or(CloudError::CommitUnconfirmed)?;
+                if <[u8; 32]>::from(Sha256::digest(&file.data)) != digest {
+                    return Err(CloudError::CommitUnconfirmed);
+                }
+                Ok(Step::Done(Done::new(file.entry)))
             }
         }
-        let data = self.data.take().ok_or(CloudError::OutOfOrder)?;
-        let mut call = self.dav.call(self.dav.request(Method::Put, &self.path, false, headers, data)?);
-        let step = call.advance(None)?;
-        self.state = WriteState::Put(call);
-        send(step)
     }
 }
 
@@ -329,55 +360,39 @@ impl Operation for Write {
 
     fn advance(&mut self, response: Option<HttpResponse>) -> Result<Step<Entry>, CloudError> {
         match std::mem::replace(&mut self.state, WriteState::Finished) {
-            WriteState::Start if response.is_none() => match &self.precondition {
-                Precondition::Matches(revision) if revision.is_weak() => {
-                    let mut call = self.dav.propfind(&self.path, "0", false)?;
-                    let step = call.advance(None)?;
-                    self.state = WriteState::Check(call);
-                    send(step)
-                }
-                _ => self.start_put(true),
-            },
-            WriteState::Check(mut call) => match call.advance(response)? {
-                CallStep::Send(request) => {
-                    self.state = WriteState::Check(call);
-                    Ok(Step::Send(request))
-                }
-                CallStep::Response(response) => {
-                    let current = self.dav.stat_result(&self.path, &response)?.and_then(|entry| entry.revision);
-                    match &self.precondition {
-                        Precondition::Matches(expected) if current.as_ref() == Some(expected) => self.start_put(false),
-                        _ => Err(CloudError::PreconditionFailed),
+            WriteState::Start(data, precondition) if response.is_none() => {
+                let mut headers = vec![("Content-Type".into(), "application/octet-stream".into())];
+                match precondition {
+                    Precondition::None => {}
+                    Precondition::Absent => headers.push(("If-None-Match".into(), "*".into())),
+                    Precondition::Matches(revision) if revision.is_strong_etag() => {
+                        headers.push(("If-Match".into(), revision.as_str().to_owned()))
                     }
+                    Precondition::Matches(_) => return Err(CloudError::UnsupportedPrecondition),
                 }
-            },
-            WriteState::Put(mut call) => match call.advance(response)? {
+                let size = data.len();
+                let digest = (size <= self.dav.config.limits.max_body_bytes).then(|| Sha256::digest(&data).into());
+                let mut call = self.dav.call(self.dav.request(Method::Put, &self.path, false, headers, data)?);
+                let step = call.advance(None)?;
+                self.state = WriteState::Put { call, size, digest };
+                send(step)
+            }
+            WriteState::Put { mut call, size, digest } => match call.advance(response)? {
                 CallStep::Send(request) => {
-                    self.state = WriteState::Put(call);
+                    self.state = WriteState::Put { call, size, digest };
                     Ok(Step::Send(request))
                 }
                 CallStep::Response(response) => match response.status {
-                    200 | 201 | 204 => {
-                        let mut call = self.dav.propfind(&self.path, "0", false)?;
-                        let step = call.advance(None)?;
-                        self.state = WriteState::Stat(call);
-                        send(step)
-                    }
+                    200 | 201 | 204 => match digest {
+                        Some(digest) => self.verify(self.dav.read(self.path.clone()), digest, None),
+                        None => Ok(Step::Done(Done::new(content_entry(self.path.clone(), size)))),
+                    },
                     409 => Err(CloudError::NotFound),
                     _ => Err(status_error(&response)),
                 },
             },
-            WriteState::Stat(mut call) => match call.advance(response)? {
-                CallStep::Send(request) => {
-                    self.state = WriteState::Stat(call);
-                    Ok(Step::Send(request))
-                }
-                CallStep::Response(response) => {
-                    let entry = self.dav.stat_result(&self.path, &response)?.ok_or(CloudError::InvalidResponse("written file missing"))?;
-                    Ok(Step::Done(Done::new(entry)))
-                }
-            },
-            WriteState::Start | WriteState::Finished => Err(CloudError::OutOfOrder),
+            WriteState::Verify { read, digest } => self.verify(read, digest, response),
+            _ => Err(CloudError::OutOfOrder),
         }
     }
 }
@@ -428,13 +443,13 @@ impl Operation for Rename {
                     _ => Err(status_error(&response)),
                 },
             },
-            RenameState::Stat(mut call) => match call.advance(response)? {
+            RenameState::Stat(mut call) => match call.advance(response).map_err(|_| CloudError::CommitUnconfirmed)? {
                 CallStep::Send(request) => {
                     self.state = RenameState::Stat(call);
                     Ok(Step::Send(request))
                 }
                 CallStep::Response(response) => {
-                    let entry = self.dav.stat_result(&self.to, &response)?.ok_or(CloudError::InvalidResponse("moved item missing"))?;
+                    let entry = self.dav.stat_result(&self.to, &response).ok().flatten().ok_or(CloudError::CommitUnconfirmed)?;
                     Ok(Step::Done(Done::new(entry)))
                 }
             },

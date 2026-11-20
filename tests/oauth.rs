@@ -114,7 +114,9 @@ fn round_trips_files_with_conditional_writes() {
         let case = format!("{:?} {access:?}", server.provider);
         let file = path("Backups/备份 #1.bin");
         let stored = server.storage_path("Backups/备份 #1.bin");
-        let written = run(&mut server, &mut client, |c| c.write(file.clone(), b"one".to_vec(), Precondition::Absent)).unwrap();
+        let supports_conditions = server.provider != FakeProvider::GoogleDrive;
+        let create = if supports_conditions { Precondition::Absent } else { Precondition::None };
+        let written = run(&mut server, &mut client, |c| c.write(file.clone(), b"one".to_vec(), create)).unwrap();
         let revision = written.revision.clone().expect("revision");
         assert_eq!((written.is_dir, written.size), (false, Some(3)));
         assert!(server.exists(&server.storage_path("Backups")), "{case}: writing creates the parent directory");
@@ -130,19 +132,21 @@ fn round_trips_files_with_conditional_writes() {
         assert_eq!(stat.revision.as_ref(), Some(&revision));
         assert!(stat.modified_at.is_some());
 
-        assert_eq!(
-            run(&mut server, &mut client, |c| c.write(file.clone(), b"x".to_vec(), Precondition::Absent)).err(),
-            Some(CloudError::PreconditionFailed)
-        );
-        server.put_external(&stored, b"other device");
-        assert_eq!(
-            run(&mut server, &mut client, |c| c.write(file.clone(), b"two".to_vec(), Precondition::Matches(revision.clone()))).err(),
-            Some(CloudError::PreconditionFailed),
-            "{case}"
-        );
-        assert_eq!(server.data(&stored).unwrap(), b"other device");
-        let current = run(&mut server, &mut client, |c| c.stat(file.clone())).unwrap().unwrap().revision.unwrap();
-        run(&mut server, &mut client, |c| c.write(file.clone(), b"two".to_vec(), Precondition::Matches(current))).unwrap();
+        if supports_conditions {
+            assert_eq!(
+                run(&mut server, &mut client, |c| c.write(file.clone(), b"x".to_vec(), Precondition::Absent)).err(),
+                Some(CloudError::PreconditionFailed)
+            );
+            server.put_external(&stored, b"other device");
+            assert_eq!(
+                run(&mut server, &mut client, |c| c.write(file.clone(), b"two".to_vec(), Precondition::Matches(revision.clone()))).err(),
+                Some(CloudError::PreconditionFailed),
+                "{case}"
+            );
+            assert_eq!(server.data(&stored).unwrap(), b"other device");
+            let current = run(&mut server, &mut client, |c| c.stat(file.clone())).unwrap().unwrap().revision.unwrap();
+            run(&mut server, &mut client, |c| c.write(file.clone(), b"two".to_vec(), Precondition::Matches(current))).unwrap();
+        }
         run(&mut server, &mut client, |c| c.write(file.clone(), b"three".to_vec(), Precondition::None)).unwrap();
         assert_eq!(server.data(&stored).as_deref(), Some(&b"three"[..]), "{case}");
 
@@ -192,7 +196,7 @@ fn app_folder_access_stays_inside_the_app_folder() {
         server.put_external("Private/secret.txt", b"secret");
         let app_folder = server.app_folder();
         server.put_external(&format!("{app_folder}/inside.txt"), b"inside");
-        run(&mut server, &mut client, |c| c.write(path("new.txt"), b"new".to_vec(), Precondition::Absent)).unwrap();
+        run(&mut server, &mut client, |c| c.write(path("new.txt"), b"new".to_vec(), Precondition::None)).unwrap();
         let root: Vec<String> = run(&mut server, &mut client, |c| c.list(RemotePath::root()))
             .unwrap()
             .into_iter()
@@ -353,65 +357,17 @@ fn google_download_is_verified_against_the_head_revision() {
     }
 }
 
-/// Drive has no conditional writes. A write that overtakes another device's write between the revision check and the
-/// upload must not silently drop it: the other device's version is put back on top and the write reports a conflict.
 #[test]
-fn google_restores_a_revision_overwritten_by_a_racing_write() {
+fn google_refuses_conditional_writes_before_sending_a_request() {
     for access in SCOPES {
         let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
         let mut client = Client::new(sign_in(&mut server, access), config());
-        let file = path("data.bin");
-        let stored = server.storage_path("data.bin");
-        let first = run(&mut server, &mut client, |c| c.write(file.clone(), b"one".to_vec(), Precondition::Absent)).unwrap();
-
-        server.races().before_update = true;
-        let raced = run(&mut server, &mut client, |c| {
-            c.write(file.clone(), b"two".to_vec(), Precondition::Matches(first.revision.clone().unwrap()))
-        });
-        assert_eq!(raced.err(), Some(CloudError::PreconditionFailed), "{access:?}");
-        assert_eq!(
-            server.data(&stored).as_deref(),
-            Some(&b"changed elsewhere"[..]),
-            "{access:?}: the other device's version is current again"
-        );
-        let restores = |server: &MemoryCloud| server.requests.iter().filter(|request| request.url.contains("/revisions/")).count();
-        assert_eq!(restores(&server), 1, "{access:?}: the overwritten revision was downloaded to put it back");
-
-        // Without a race the same check passes.
-        let current = run(&mut server, &mut client, |c| c.stat(file.clone())).unwrap().unwrap().revision.unwrap();
-        let written = run(&mut server, &mut client, |c| c.write(file.clone(), b"three".to_vec(), Precondition::Matches(current))).unwrap();
-        assert_eq!(server.data(&stored).as_deref(), Some(&b"three"[..]));
-        assert_eq!(restores(&server), 1, "{access:?}: nothing to restore without a race");
-        let read = run(&mut server, &mut client, |c| c.read(file.clone())).unwrap().unwrap();
-        assert_eq!(read.entry.revision, written.revision);
-    }
-}
-
-/// Names are not unique on Drive: when two devices create the same file at once, the older one wins on both, and the
-/// newer one is removed by its writer.
-#[test]
-fn google_concurrent_creates_converge_on_the_oldest() {
-    for access in SCOPES {
-        let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
-        let mut client = Client::new(sign_in(&mut server, access), config());
-        let stored = server.storage_path("Backups/data.bin");
-        run(&mut server, &mut client, |c| c.create_dir(path("Backups"))).unwrap_or_default();
-        server.races().before_create = true;
-        let raced = run(&mut server, &mut client, |c| c.write(path("Backups/data.bin"), b"mine".to_vec(), Precondition::Absent));
-        assert_eq!(raced.err(), Some(CloudError::PreconditionFailed), "{access:?}");
-        assert_eq!((server.copies(&stored), server.data(&stored).as_deref()), (1, Some(&b"other device"[..])), "{access:?}");
-
-        // Overwriting unconditionally lands in the surviving file instead of leaving a duplicate.
-        server.races().before_create = true;
-        run(&mut server, &mut client, |c| c.write(path("Backups/other.bin"), b"mine".to_vec(), Precondition::None)).unwrap();
-        let other = server.storage_path("Backups/other.bin");
-        assert_eq!((server.copies(&other), server.data(&other).as_deref()), (1, Some(&b"mine"[..])), "{access:?}");
-
-        // Folders created along the way are deduplicated the same way.
-        server.races().before_create = true;
-        run(&mut server, &mut client, |c| c.write(path("New/v.bin"), b"v".to_vec(), Precondition::Absent)).unwrap();
-        assert_eq!(server.copies(&server.storage_path("New")), 1, "{access:?}");
-        assert_eq!(server.data(&server.storage_path("New/v.bin")).as_deref(), Some(&b"v"[..]));
+        let sent = server.requests.len();
+        for condition in [Precondition::Absent, Precondition::Matches(cloudset::Revision::new("r1"))] {
+            let result = run(&mut server, &mut client, |c| c.write(path("Missing/data.bin"), vec![1], condition));
+            assert_eq!(result.unwrap_err(), CloudError::UnsupportedPrecondition);
+        }
+        assert_eq!(server.requests.len(), sent);
     }
 }
 
@@ -422,7 +378,9 @@ fn google_duplicates_resolve_to_the_oldest_item() {
     let mut client = Client::new(sign_in(&mut server, AccessScope::Full), config());
     server.put_external("dup.bin", b"old");
     server.races().before_create = true;
-    run(&mut server, &mut client, |c| c.write(path("fresh.bin"), b"x".to_vec(), Precondition::Absent)).unwrap_err();
+    let result = run(&mut server, &mut client, |c| c.write(path("fresh.bin"), b"x".to_vec(), Precondition::None));
+    assert_eq!(result.unwrap_err(), CloudError::CommitUnconfirmed);
+    assert_eq!(server.copies("fresh.bin"), 1, "the file created next to the other device's is removed again");
     let entries = run(&mut server, &mut client, |c| c.list(RemotePath::root())).unwrap();
     let names: Vec<String> = entries.iter().map(|entry| entry.path.to_string()).collect();
     assert_eq!(names, ["dup.bin", "fresh.bin"], "each name listed once");
@@ -439,7 +397,238 @@ fn google_app_folder_is_created_once() {
     assert!(!server.exists(GOOGLE_APP_FOLDER));
     assert_eq!(run(&mut server, &mut client, |c| c.list(RemotePath::root())).unwrap(), Vec::new());
     assert!(server.exists(GOOGLE_APP_FOLDER), "listing the root creates the app folder");
-    run(&mut server, &mut client, |c| c.write(path("data.bin"), b"v".to_vec(), Precondition::Absent)).unwrap();
+    run(&mut server, &mut client, |c| c.write(path("data.bin"), b"v".to_vec(), Precondition::None)).unwrap();
     run(&mut server, &mut client, |c| c.stat(path("data.bin"))).unwrap();
     assert_eq!(server.copies(GOOGLE_APP_FOLDER), 1);
+}
+
+#[test]
+fn google_confirms_new_file_visibility_before_reporting_success() {
+    let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
+    let client = Client::new(sign_in(&mut server, AccessScope::Full), config());
+    let mut uploaded = false;
+    let result = cloudset::run(client.write(path("data.bin"), vec![1], Precondition::None).as_mut(), |request| {
+        if uploaded {
+            return cloudset::HttpResponse::new(503);
+        }
+        uploaded = request.method == cloudset::Method::Post && request.url.contains("uploadType=multipart");
+        server.handle(request)
+    });
+    assert_eq!(result.unwrap_err(), CloudError::CommitUnconfirmed);
+    assert_eq!(server.data("data.bin"), Some(vec![1]));
+}
+
+#[test]
+fn google_name_lookup_follows_empty_pages_and_breaks_ties_across_pages() {
+    let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
+    let client = Client::new(sign_in(&mut server, AccessScope::Full), config());
+    let pages = [
+        (None, r#"{"nextPageToken":"p1","files":[]}"#),
+        (Some("p1"), r#"{"nextPageToken":"p2","files":[{"name":"doc","id":"z","headRevisionId":"r2"}]}"#),
+        (Some("p2"), r#"{"files":[{"name":"doc","id":"a","headRevisionId":"r1"}]}"#),
+    ];
+    let mut pages = pages.into_iter();
+    let done = cloudset::run(client.stat(path("doc")).as_mut(), |request| {
+        let (token, body) = pages.next().unwrap();
+        let url = url::Url::parse(&request.url).unwrap();
+        let seen = url.query_pairs().find(|(key, _)| key == "pageToken").map(|(_, value)| value);
+        assert_eq!(seen.as_deref(), token);
+        cloudset::HttpResponse::new(200).with_body(body.as_bytes().to_vec())
+    })
+    .unwrap();
+    assert_eq!(pages.count(), 0);
+    assert_eq!(done.value.unwrap().revision.unwrap().as_str(), "r1");
+}
+
+/// Personal OneDrive accounts return bare `eTag` tokens (`aRDQ2…`) where work accounts return quoted entity-tags.
+#[test]
+fn onedrive_matches_bare_etags_and_refuses_ambiguous_ones() {
+    let mut server = MemoryCloud::new(FakeProvider::OneDrive);
+    server.bare_etags = true;
+    let mut client = Client::new(sign_in(&mut server, AccessScope::AppFolder), config());
+    let file = path("data.bin");
+    let first = run(&mut server, &mut client, |c| c.write(file.clone(), b"one".to_vec(), Precondition::Absent)).unwrap();
+    let revision = first.revision.unwrap();
+    assert!(!revision.as_str().starts_with('"'));
+    let check = Precondition::Matches(revision);
+    assert!(client.supports_write_precondition(3, &check));
+    run(&mut server, &mut client, |c| c.write(file.clone(), b"two".to_vec(), check.clone())).unwrap();
+    assert_eq!(run(&mut server, &mut client, |c| c.write(file.clone(), b"x".to_vec(), check)).err(), Some(CloudError::PreconditionFailed));
+
+    let sent = server.requests.len();
+    for tag in ["*", "W/\"a\"", "a, b", "\"a\", \"b\"", ""] {
+        let check = Precondition::Matches(cloudset::Revision::new(tag));
+        assert!(!client.supports_write_precondition(1, &check), "{tag}");
+        let result = run(&mut server, &mut client, |c| c.write(file.clone(), vec![1], check));
+        assert_eq!(result.err(), Some(CloudError::UnsupportedPrecondition), "{tag}");
+    }
+    assert_eq!(server.requests.len(), sent);
+}
+
+/// A name lookup right after a create or move may not show the new item yet; the response already confirmed it.
+#[test]
+fn google_trusts_the_response_when_the_listing_lags() {
+    let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
+    let client = Client::new(sign_in(&mut server, AccessScope::Full), config());
+    // After a mutation, every lookup of the names in `hidden` comes back empty.
+    fn lagging<T>(server: &mut MemoryCloud, mut operation: cloudset::BoxOperation<T>, hidden: &[&str]) -> Result<T, CloudError> {
+        let (mut mutated, mut hidden_lookups) = (false, 0);
+        let result = cloudset::run(operation.as_mut(), |request| {
+            let lookup = request.method == cloudset::Method::Get
+                && hidden.iter().any(|name| request.url.contains(&format!("name+%3D+%27{name}%27")));
+            if mutated && lookup {
+                hidden_lookups += 1;
+                return cloudset::HttpResponse::new(200).with_body(br#"{"files":[]}"#.to_vec());
+            }
+            mutated |= request.method != cloudset::Method::Get;
+            server.handle(request)
+        })
+        .map(|done| done.value);
+        assert!(hidden_lookups > 0, "the lookup after the mutation was answered empty");
+        result
+    }
+    let written = lagging(&mut server, client.write(path("Dir/data.bin"), vec![1], Precondition::None), &["Dir", "data.bin"]).unwrap();
+    assert!(written.revision.is_some());
+    assert_eq!((server.copies("Dir"), server.data("Dir/data.bin")), (1, Some(vec![1])));
+    lagging(&mut server, client.create_dir(path("Other")), &["Other"]).unwrap();
+    assert_eq!(server.copies("Other"), 1);
+    let moved = lagging(&mut server, client.rename(path("Dir/data.bin"), path("Other/moved.bin")), &["moved.bin"]).unwrap();
+    assert_eq!(moved.path, path("Other/moved.bin"));
+    assert_eq!(server.data("Other/moved.bin"), Some(vec![1]));
+}
+
+#[test]
+fn google_bounds_pages_without_items() {
+    let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
+    let client = Client::new(sign_in(&mut server, AccessScope::Full), config());
+    for mut operation in [cloudset::map(client.stat(path("doc")), |_| ()), cloudset::map(client.list(RemotePath::root()), |_| ())] {
+        let mut requests = 0;
+        let result = cloudset::run(operation.as_mut(), |_| {
+            requests += 1;
+            cloudset::HttpResponse::new(200).with_body(br#"{"nextPageToken":"again","files":[]}"#.to_vec())
+        });
+        assert_eq!(result.err(), Some(CloudError::TooLarge));
+        assert!(requests < 40, "{requests}");
+    }
+}
+
+/// `If-Match` names a version of an existing file. A server that answers "created" did not apply it.
+#[test]
+fn onedrive_does_not_take_created_for_a_matched_write() {
+    let mut server = MemoryCloud::new(FakeProvider::OneDrive);
+    let client = Client::new(sign_in(&mut server, AccessScope::AppFolder), config());
+    let check = Precondition::Matches(cloudset::Revision::new("\"{ITEM},1\""));
+    let mut write = client.write(path("data.bin"), vec![1], check);
+    let result = cloudset::run(write.as_mut(), |_| {
+        cloudset::HttpResponse::new(201).with_body(br#"{"name":"data.bin","eTag":"\"{ITEM},1\""}"#.to_vec())
+    });
+    assert_eq!(result.err(), Some(CloudError::CommitUnconfirmed));
+}
+
+/// Revoking a grant the user already removed in their Dropbox account is done, not an error.
+#[test]
+fn dropbox_revoke_of_a_dead_grant_succeeds_without_a_refresh() {
+    let mut server = MemoryCloud::new(FakeProvider::Dropbox);
+    let mut client = Client::new(sign_in(&mut server, AccessScope::AppFolder), config());
+    server.expire_access_token();
+    server.revoked = true;
+    let before = server.requests.len();
+    run(&mut server, &mut client, |c| c.revoke()).unwrap();
+    assert!(server.requests[before..].iter().all(|request| !request.url.contains("oauth2/token")));
+}
+
+/// Something in the way of a write is not "the file changed": re-reading and retrying would never get past it.
+#[test]
+fn dropbox_reports_obstacles_as_forbidden() {
+    let mut server = MemoryCloud::new(FakeProvider::Dropbox);
+    let client = Client::new(sign_in(&mut server, AccessScope::AppFolder), config());
+    let conflict = |summary: &str| cloudset::HttpResponse::new(409).with_body(format!(r#"{{"error_summary":"{summary}"}}"#).into_bytes());
+    let attempt = |precondition, summary: &str| {
+        cloudset::run(client.write(path("a/b.txt"), vec![1], precondition).as_mut(), |_| conflict(summary)).map(|done| done.value)
+    };
+    assert_eq!(attempt(Precondition::None, "path/conflict/folder/.").err(), Some(CloudError::Forbidden));
+    assert_eq!(attempt(Precondition::Absent, "path/conflict/folder/.").err(), Some(CloudError::PreconditionFailed));
+    assert_eq!(attempt(Precondition::None, "path/conflict/file_ancestor/.").err(), Some(CloudError::Forbidden));
+    assert_eq!(attempt(Precondition::Absent, "path/conflict/file/.").err(), Some(CloudError::PreconditionFailed));
+    let listing = cloudset::run(client.list(path("file.txt")).as_mut(), |_| conflict("path/not_folder/."));
+    assert_eq!(listing.err(), Some(CloudError::NotFound));
+}
+
+/// Google's "Desktop app" clients: the callback arrives on a loopback port, and the client secret goes with the code
+/// exchange and with every refresh.
+#[test]
+fn google_desktop_client_signs_in_over_loopback_with_its_secret() {
+    let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
+    server.client_secret = Some("desktop-secret".to_owned());
+    let redirect = "http://127.0.0.1:49152/";
+    let client = OAuthClient::new("desktop.apps.googleusercontent.com", redirect).with_folder_name(GOOGLE_APP_FOLDER);
+
+    // Without the secret, the token endpoint turns the code down.
+    let authorization = begin(ProviderKind::GoogleDrive, AccessScope::AppFolder, client.clone(), &[1; 64]).unwrap();
+    let callback = server.authorize(authorization.url());
+    let refused = cloudset::run(authorization.complete(&callback, &config()).unwrap().as_mut(), |request| server.handle(request));
+    assert_eq!(refused.err(), Some(CloudError::ReauthRequired));
+
+    let client = client.with_client_secret("desktop-secret");
+    assert!(!format!("{client:?}").contains("desktop-secret"), "Debug must not print the secret");
+    let authorization = begin(ProviderKind::GoogleDrive, AccessScope::AppFolder, client, &[2; 64]).unwrap();
+    assert!(!authorization.url().contains("desktop-secret"), "the secret never goes into the browser");
+    let callback = server.authorize(authorization.url());
+    assert!(callback.starts_with("http://127.0.0.1:49152/?"));
+    assert!(authorization.accepts(&callback));
+    for elsewhere in ["http://127.0.0.1:49153/", "http://localhost:49152/", "http://127.0.0.1:49152/other", "https://127.0.0.1:49152/"] {
+        let moved = callback.replacen(redirect, elsewhere, 1);
+        assert!(!authorization.accepts(&moved), "{elsewhere}");
+    }
+    let before = server.requests.len();
+    let connection =
+        cloudset::run(authorization.complete(&callback, &config()).unwrap().as_mut(), |request| server.handle(request)).unwrap().value;
+    let exchange = String::from_utf8(server.requests[before].body.clone()).unwrap();
+    assert!(exchange.contains("client_secret=desktop-secret") && exchange.contains("code_verifier="), "{exchange}");
+    assert!(exchange.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2F"));
+    assert!(!format!("{connection:?}").contains("desktop-secret"));
+
+    // The secret is stored with the connection, and a refresh sends it again.
+    let restored = cloudset::Connection::from_bytes(&connection.to_bytes()).unwrap();
+    assert_eq!(restored, connection);
+    let mut client = Client::new(restored, config());
+    server.expire_access_token();
+    let before = server.requests.len();
+    run(&mut server, &mut client, |c| c.stat(path("missing"))).unwrap();
+    let refresh = server.requests[before..].iter().find(|request| request.url.ends_with("/token")).expect("a refresh");
+    assert!(String::from_utf8(refresh.body.clone()).unwrap().contains("client_secret=desktop-secret"));
+}
+
+/// Behaviors of the live service (a personal account, November 2026) that differ from what the documentation suggests.
+#[test]
+fn onedrive_matches_the_live_service_in_its_odd_corners() {
+    for access in SCOPES {
+        let mut server = MemoryCloud::new(FakeProvider::OneDrive);
+        let mut client = Client::new(sign_in(&mut server, access), config());
+        let file = path("Dir/data.bin");
+        run(&mut server, &mut client, |c| c.create_dir(path("Dir"))).unwrap();
+        run(&mut server, &mut client, |c| c.create_dir(path("Dir/Sub"))).unwrap();
+        let written = run(&mut server, &mut client, |c| c.write(file.clone(), b"one".to_vec(), Precondition::Absent)).unwrap();
+        let revision = written.revision.unwrap();
+
+        // `If-Match` is ignored for a file that is gone, and the file is created: it must not stay.
+        run(&mut server, &mut client, |c| c.delete(file.clone())).unwrap();
+        let gone = run(&mut server, &mut client, |c| c.write(file.clone(), b"two".to_vec(), Precondition::Matches(revision.clone())));
+        assert_eq!(gone.err(), Some(CloudError::PreconditionFailed), "{access:?}");
+        assert!(!server.exists(&server.storage_path("Dir/data.bin")), "{access:?}: the file created against the condition is removed");
+
+        // A folder in the way of a file.
+        let onto = |precondition| client.write(path("Dir/Sub"), vec![1], precondition);
+        assert_eq!(cloudset::run(onto(Precondition::None).as_mut(), |request| server.handle(request)).err(), Some(CloudError::Forbidden));
+        assert_eq!(
+            cloudset::run(onto(Precondition::Absent).as_mut(), |request| server.handle(request)).err(),
+            Some(CloudError::PreconditionFailed)
+        );
+
+        // Children of a file, and a move whose source is missing.
+        run(&mut server, &mut client, |c| c.write(file.clone(), b"three".to_vec(), Precondition::None)).unwrap();
+        assert_eq!(run(&mut server, &mut client, |c| c.list(file.clone())).err(), Some(CloudError::NotFound), "{access:?}");
+        let missing = run(&mut server, &mut client, |c| c.rename(path("Dir/nope.bin"), path("Dir/other.bin")));
+        assert_eq!(missing.err(), Some(CloudError::NotFound), "{access:?}");
+    }
 }

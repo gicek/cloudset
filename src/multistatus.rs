@@ -70,34 +70,46 @@ struct Propstat {
     props: DavEntry,
 }
 
+fn succeeded(status: Option<u16>) -> bool {
+    status.is_none_or(|status| (200..300).contains(&status))
+}
+
 #[derive(Default)]
 struct ResponseBuilder {
     href: Option<String>,
-    propstats: Vec<Propstat>,
+    /// The status of the response as a whole (the `href` + `status` form of RFC 4918 §14.24).
+    status: Option<u16>,
+    props: DavEntry,
 }
 
 impl ResponseBuilder {
-    /// Merges every 2xx (or status-less) propstat; properties that only appear in failed propstats (404 etc.) count as absent.
-    fn finish(self) -> Option<DavEntry> {
-        let mut entry = DavEntry { href: self.href?, ..DavEntry::default() };
-        for propstat in self.propstats.into_iter().filter(|p| p.status.is_none_or(|s| (200..300).contains(&s))) {
+    /// Merges a 2xx (or status-less) propstat; properties that only appear in failed propstats (404 etc.) count as absent.
+    fn merge(&mut self, propstat: Propstat) {
+        if succeeded(propstat.status) {
             let props = propstat.props;
-            entry.is_dir |= props.is_dir;
-            entry.size = entry.size.or(props.size);
-            entry.modified_at = entry.modified_at.or(props.modified_at);
-            entry.etag = entry.etag.or(props.etag);
+            self.props.is_dir |= props.is_dir;
+            self.props.size = self.props.size.or(props.size);
+            self.props.modified_at = self.props.modified_at.or(props.modified_at);
+            self.props.etag = self.props.etag.take().or(props.etag);
         }
-        Some(entry)
     }
 }
 
-pub(crate) fn parse(body: &[u8], max_entries: usize) -> Result<Vec<DavEntry>, CloudError> {
+/// A parsed multistatus body.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Multistatus {
+    pub entries: Vec<DavEntry>,
+    /// The `href`s the server reports as missing (a 404 status for the whole response).
+    pub missing: Vec<String>,
+}
+
+pub(crate) fn parse(body: &[u8], max_entries: usize) -> Result<Multistatus, CloudError> {
     let mut reader = NsReader::from_reader(body);
     reader.config_mut().expand_empty_elements = true;
     let mut buf = Vec::new();
     let mut stack: Vec<Tag> = Vec::new();
     let mut text = String::new();
-    let mut entries = Vec::new();
+    let mut parsed = Multistatus::default();
     let mut response: Option<ResponseBuilder> = None;
     let mut propstat: Option<Propstat> = None;
     let mut saw_root = false;
@@ -117,10 +129,11 @@ pub(crate) fn parse(body: &[u8], max_entries: usize) -> Result<Vec<DavEntry>, Cl
                 if stack.len() >= MAX_DEPTH {
                     return Err(CloudError::InvalidResponse("xml too deep"));
                 }
-                match (stack.last(), tag) {
-                    (Some(Tag::Multistatus), Tag::Response) => response = Some(ResponseBuilder::default()),
-                    (Some(Tag::Response), Tag::Propstat) => propstat = Some(Propstat::default()),
-                    (Some(Tag::ResourceType), Tag::Collection) => {
+                // Elements only count at their place in the document: a property value may itself contain DAV elements.
+                match (stack.last(), tag, stack.len()) {
+                    (Some(Tag::Multistatus), Tag::Response, 1) => response = Some(ResponseBuilder::default()),
+                    (Some(Tag::Response), Tag::Propstat, 2) => propstat = Some(Propstat::default()),
+                    (Some(Tag::ResourceType), Tag::Collection, 5) => {
                         if let Some(propstat) = propstat.as_mut() {
                             propstat.props.is_dir = true;
                         }
@@ -134,33 +147,44 @@ pub(crate) fn parse(body: &[u8], max_entries: usize) -> Result<Vec<DavEntry>, Cl
                 let tag = stack.pop().ok_or(CloudError::InvalidResponse("malformed xml"))?;
                 let parent = stack.last().copied();
                 let value = text.trim();
-                match (parent, tag) {
-                    (Some(Tag::Response), Tag::Href) => {
+                match (parent, tag, stack.len()) {
+                    (Some(Tag::Response), Tag::Href, 2) => {
                         if let Some(response) = response.as_mut() {
                             response.href = Some(value.to_owned());
                         }
                     }
-                    (Some(Tag::Propstat), Tag::Status) => {
+                    (Some(Tag::Response), Tag::Status, 2) => {
+                        if let Some(response) = response.as_mut() {
+                            response.status = parse_status(value);
+                        }
+                    }
+                    (Some(Tag::Propstat), Tag::Status, 3) => {
                         if let Some(propstat) = propstat.as_mut() {
                             propstat.status = parse_status(value);
                         }
                     }
-                    (Some(Tag::Prop), Tag::ContentLength | Tag::LastModified | Tag::Etag) => {
+                    (Some(Tag::Prop), Tag::ContentLength | Tag::LastModified | Tag::Etag, 4) => {
                         if let Some(propstat) = propstat.as_mut() {
                             set_prop(&mut propstat.props, tag, value);
                         }
                     }
-                    (Some(Tag::Response), Tag::Propstat) => {
+                    (Some(Tag::Response), Tag::Propstat, 2) => {
                         if let (Some(response), Some(propstat)) = (response.as_mut(), propstat.take()) {
-                            response.propstats.push(propstat);
+                            response.merge(propstat);
                         }
                     }
-                    (Some(Tag::Multistatus), Tag::Response) => {
-                        if let Some(entry) = response.take().and_then(ResponseBuilder::finish) {
-                            if entries.len() >= max_entries {
+                    (Some(Tag::Multistatus), Tag::Response, 1) => {
+                        // A response without an `href`, or one that failed for another reason (403 and the like), names
+                        // nothing usable.
+                        if let Some(ResponseBuilder { href: Some(href), status, props }) = response.take() {
+                            if parsed.entries.len() + parsed.missing.len() >= max_entries {
                                 return Err(CloudError::TooLarge);
                             }
-                            entries.push(entry);
+                            if succeeded(status) {
+                                parsed.entries.push(DavEntry { href, ..props });
+                            } else if status == Some(404) {
+                                parsed.missing.push(href);
+                            }
                         }
                     }
                     _ => {}
@@ -197,7 +221,7 @@ pub(crate) fn parse(body: &[u8], max_entries: usize) -> Result<Vec<DavEntry>, Cl
     if !saw_root || !stack.is_empty() {
         return Err(CloudError::InvalidResponse("not a multistatus"));
     }
-    Ok(entries)
+    Ok(parsed)
 }
 
 fn parse_status(line: &str) -> Option<u16> {
@@ -236,7 +260,7 @@ mod tests {
       <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
   </d:response>
 </d:multistatus>"#;
-        let entries = parse(body, 10).unwrap();
+        let entries = parse(body, 10).unwrap().entries;
         assert_eq!(
             entries[0],
             DavEntry { href: "/dav/Backups/".into(), is_dir: true, etag: Some("\"dir1\"".into()), ..DavEntry::default() }
@@ -253,14 +277,46 @@ mod tests {
         );
 
         let default_ns = br#"<multistatus xmlns="DAV:"><response><href>https://x/a</href><propstat><prop><getetag>W/"1"</getetag></prop></propstat></response></multistatus>"#;
-        assert_eq!(parse(default_ns, 10).unwrap()[0].etag.as_deref(), Some("W/\"1\""));
+        assert_eq!(parse(default_ns, 10).unwrap().entries[0].etag.as_deref(), Some("W/\"1\""));
     }
 
     #[test]
     fn ignores_foreign_namespaces_with_dav_names() {
         let body = br#"<d:multistatus xmlns:d="DAV:" xmlns:x="urn:x"><d:response><d:href>/a</d:href><d:propstat><d:prop>
             <d:resourcetype><x:collection/></d:resourcetype><x:getetag>"no"</x:getetag></d:prop></d:propstat></d:response></d:multistatus>"#;
-        assert_eq!(parse(body, 10).unwrap()[0], DavEntry { href: "/a".into(), ..DavEntry::default() });
+        assert_eq!(parse(body, 10).unwrap().entries[0], DavEntry { href: "/a".into(), ..DavEntry::default() });
+    }
+
+    #[test]
+    fn reads_the_status_of_a_whole_response() {
+        let body = br#"<d:multistatus xmlns:d="DAV:">
+            <d:response><d:href>/dav/gone.txt</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>
+            <d:response><d:href>/dav/secret.txt</d:href><d:status>HTTP/1.1 403 Forbidden</d:status></d:response>
+            <d:response><d:href>/dav/a.txt</d:href><d:status>HTTP/1.1 200 OK</d:status></d:response>
+        </d:multistatus>"#;
+        let parsed = parse(body, 10).unwrap();
+        assert_eq!(parsed.entries, [DavEntry { href: "/dav/a.txt".into(), ..DavEntry::default() }]);
+        assert_eq!(parsed.missing, ["/dav/gone.txt"]);
+    }
+
+    #[test]
+    fn dav_elements_inside_a_property_value_are_not_structure() {
+        let body = br#"<d:multistatus xmlns:d="DAV:" xmlns:x="urn:x"><d:response><d:href>/real</d:href><d:propstat><d:prop>
+            <d:getetag>"1"</d:getetag>
+            <x:p><d:multistatus><d:response><d:href>/fake</d:href><d:propstat><d:prop><d:getetag>"2"</d:getetag>
+                <d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response></d:multistatus>
+                <d:href>/also-fake</d:href><d:status>HTTP/1.1 404 Not Found</d:status></x:p>
+            </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
+        let parsed = parse(body, 10).unwrap();
+        assert_eq!(parsed.entries, [DavEntry { href: "/real".into(), etag: Some("\"1\"".into()), ..DavEntry::default() }]);
+        assert!(parsed.missing.is_empty());
+    }
+
+    #[test]
+    fn propstats_are_merged_as_they_arrive() {
+        let propstats = r#"<d:propstat><d:prop><d:getetag>"e"</d:getetag></d:prop></d:propstat>"#.repeat(5_000);
+        let body = format!(r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/a</d:href>{propstats}</d:response></d:multistatus>"#);
+        assert_eq!(parse(body.as_bytes(), 1).unwrap().entries[0].etag.as_deref(), Some("\"e\""));
     }
 
     #[test]

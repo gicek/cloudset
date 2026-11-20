@@ -38,7 +38,8 @@ fn large_files_go_up_in_chunks_with_every_precondition() {
             let first = server.requests.len();
             let (max_body, marker) = expectations(provider);
 
-            let created = run(&mut server, &mut client, |c| c.write(path("Big/data.bin"), large(1), Precondition::Absent)).unwrap();
+            let create = if provider == FakeProvider::GoogleDrive { Precondition::None } else { Precondition::Absent };
+            let created = run(&mut server, &mut client, |c| c.write(path("Big/data.bin"), large(1), create)).unwrap();
             assert_eq!(created.size, Some(SIZE as u64), "{case}");
             assert_eq!(server.data(&server.storage_path("Big/data.bin")), Some(large(1)), "{case}");
             let sent = &server.requests[first..];
@@ -48,10 +49,22 @@ fn large_files_go_up_in_chunks_with_every_precondition() {
             let file = run(&mut server, &mut client, |c| c.read(path("Big/data.bin"))).unwrap().unwrap();
             assert_eq!((file.data == large(1), file.entry.revision.is_some()), (true, true), "{case}: reads back");
 
+            if provider == FakeProvider::GoogleDrive {
+                continue;
+            }
             let again = run(&mut server, &mut client, |c| c.write(path("Big/data.bin"), large(2), Precondition::Absent));
             assert_eq!(again.err(), Some(CloudError::PreconditionFailed), "{case}: Absent on an existing file");
 
             let revision = file.entry.revision.clone().unwrap();
+            if provider == FakeProvider::OneDrive {
+                let before = server.requests.len();
+                let refused = run(&mut server, &mut client, |c| c.write(path("Big/data.bin"), large(3), Precondition::Matches(revision)));
+                assert_eq!(refused.err(), Some(CloudError::UnsupportedPrecondition));
+                assert_eq!(server.requests.len(), before);
+                run(&mut server, &mut client, |c| c.write(path("Big/data.bin"), large(5), Precondition::None)).unwrap();
+                assert_eq!(server.data(&server.storage_path("Big/data.bin")), Some(large(5)));
+                continue;
+            }
             let updated =
                 run(&mut server, &mut client, |c| c.write(path("Big/data.bin"), large(3), Precondition::Matches(revision.clone())))
                     .unwrap();
@@ -74,7 +87,7 @@ fn small_files_stay_single_requests() {
         let mut server = MemoryCloud::new(provider);
         let mut client = sign_in(&mut server, AccessScope::AppFolder, &config());
         let first = server.requests.len();
-        run(&mut server, &mut client, |c| c.write(path("small.bin"), vec![7; 64 * 1024], Precondition::Absent)).unwrap();
+        run(&mut server, &mut client, |c| c.write(path("small.bin"), vec![7; 64 * 1024], Precondition::None)).unwrap();
         let (_, marker) = expectations(provider);
         assert!(server.requests[first..].iter().all(|request| !request.url.contains(marker)), "{provider:?}");
     }
@@ -125,14 +138,15 @@ fn a_session_without_progress_fails_instead_of_looping() {
 }
 
 #[test]
-fn google_drive_restores_a_large_revision_written_concurrently() {
+fn google_large_upload_refuses_a_version_condition_before_sending_data() {
     let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
     let mut client = sign_in(&mut server, AccessScope::AppFolder, &chunked());
-    let written = run(&mut server, &mut client, |c| c.write(path("data.bin"), large(1), Precondition::Absent)).unwrap();
-    server.races().before_update = true;
+    let written = run(&mut server, &mut client, |c| c.write(path("data.bin"), large(1), Precondition::None)).unwrap();
+    let before = server.requests.len();
     let result = run(&mut server, &mut client, |c| c.write(path("data.bin"), large(2), Precondition::Matches(written.revision.unwrap())));
-    assert_eq!(result.err(), Some(CloudError::PreconditionFailed));
-    assert_eq!(server.data(&server.storage_path("data.bin")).as_deref(), Some(&b"changed elsewhere"[..]), "the other write stays current");
+    assert_eq!(result.err(), Some(CloudError::UnsupportedPrecondition));
+    assert_eq!(server.requests.len(), before);
+    assert_eq!(server.data(&server.storage_path("data.bin")), Some(large(1)));
 }
 
 #[test]
@@ -177,14 +191,66 @@ fn a_server_claiming_more_than_was_sent_is_refused() {
     }
 }
 
-/// Documents the OneDrive limitation: `If-Match` is checked when the session opens, not when it completes.
 #[test]
-fn onedrive_checks_matches_when_the_session_opens() {
+fn onedrive_clamps_chunks_strictly_below_sixty_mib() {
+    let unit = 320 * 1024;
+    // Force a session above the simple-upload threshold without recording a huge request in MemoryCloud.
     let mut server = MemoryCloud::new(FakeProvider::OneDrive);
-    let mut client = sign_in(&mut server, AccessScope::AppFolder, &chunked());
-    let written = run(&mut server, &mut client, |c| c.write(path("data.bin"), large(1), Precondition::Absent)).unwrap();
-    let stale = written.revision.clone().unwrap();
-    server.put_external(&server.storage_path("data.bin"), b"changed elsewhere");
-    let refused = run(&mut server, &mut client, |c| c.write(path("data.bin"), large(2), Precondition::Matches(stale)));
-    assert_eq!(refused.err(), Some(CloudError::PreconditionFailed), "a change before the upload starts is caught");
+    let config = config().with_limits(Limits::default().with_upload_chunk_bytes(60 * 1024 * 1024));
+    let client = sign_in(&mut server, AccessScope::AppFolder, &config);
+    let mut operation = client.write(path("large.bin"), vec![0; 60 * 1024 * 1024 + 1], Precondition::None);
+    let cloudset::Step::Send(open) = operation.advance(None).unwrap() else { panic!("expected upload session") };
+    let cloudset::Step::Send(chunk) = operation.advance(Some(server.handle(open))).unwrap() else { panic!("expected first chunk") };
+    assert_eq!(chunk.body.len(), 60 * 1024 * 1024 - unit);
+}
+
+/// "Send it in one piece" must not overflow when the server acknowledges only part of that piece.
+#[test]
+fn google_resumes_after_a_partial_chunk_with_an_unbounded_chunk_size() {
+    let mut server = MemoryCloud::new(FakeProvider::GoogleDrive);
+    let unbounded = config().with_limits(Limits::default().with_upload_chunk_bytes(usize::MAX));
+    let client = sign_in(&mut server, AccessScope::AppFolder, &unbounded);
+    let data = large(3);
+    let mut interrupted = false;
+    let mut operation = client.write(path("data.bin"), data.clone(), Precondition::None);
+    let result = cloudset::run(operation.as_mut(), |request| {
+        if !interrupted && request.method == cloudset::Method::Put {
+            interrupted = true;
+            // Only the first MiB arrived; the server never saw the rest of this request.
+            let mut partial = request.clone();
+            partial.body.truncate(1024 * 1024);
+            partial.headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Content-Range"));
+            partial.headers.push(("Content-Range".into(), format!("bytes 0-{}/{}", 1024 * 1024 - 1, SIZE)));
+            return server.handle(partial);
+        }
+        server.handle(request)
+    });
+    assert!(interrupted);
+    result.unwrap();
+    assert_eq!(server.data(&server.storage_path("data.bin")), Some(data));
+}
+
+/// A pre-signed URL carries no token: its refusals say nothing about the sign-in, the permissions or the path.
+#[test]
+fn onedrive_presigned_url_refusals_are_server_errors() {
+    for status in [400, 401, 403] {
+        let mut server = MemoryCloud::new(FakeProvider::OneDrive);
+        let client = sign_in(&mut server, AccessScope::AppFolder, &chunked());
+        let mut write = client.write(path("data.bin"), large(1), Precondition::None);
+        let result = cloudset::run(write.as_mut(), |request| {
+            if request.url.contains("upload.example.net") {
+                return HttpResponse::new(status).with_body(br#"{"error":{"code":"invalidRequest"}}"#.to_vec());
+            }
+            server.handle(request)
+        });
+        assert_eq!(result.err(), Some(CloudError::Server { status }));
+
+        let mut client = client;
+        run(&mut server, &mut client, |c| c.write(path("small.bin"), vec![1], Precondition::None)).unwrap();
+        let mut read = client.read(path("small.bin"));
+        let result = cloudset::run(read.as_mut(), |request| {
+            if request.header("Authorization").is_none() { HttpResponse::new(status) } else { server.handle(request) }
+        });
+        assert_eq!(result.err(), Some(CloudError::Server { status }));
+    }
 }

@@ -11,10 +11,10 @@ the HTTP requests and parses the responses, and you send them with the HTTP clie
 
 - **Bring your own transport.** No sockets, no async runtime, no TLS stack. Operations are plain state machines, so the
   same code runs with `ureq`, `reqwest`, `hyper`, a platform HTTP API over FFI, or an in-memory test server.
-- **Safe concurrent writes.** Every provider supports the same conditional writes (create only if absent, overwrite only
-  if unchanged), including Google Drive, which has none of its own.
-- **Sign-in included.** OAuth 2.0 with PKCE for Dropbox, OneDrive and Google Drive (no client secret), and Nextcloud
-  Login Flow v2. Tokens refresh automatically.
+- **Conditional writes.** Check `Client::supports_write_precondition` for the payload and revision. A strict write
+  returns `UnsupportedPrecondition` if the backend cannot enforce it. See the [provider matrix](docs/PROVIDERS.md).
+- **Sign-in included.** OAuth 2.0 with PKCE for Dropbox, OneDrive and Google Drive, with a custom scheme or loopback
+  redirect, and Nextcloud Login Flow v2. Tokens refresh automatically.
 - **Careful with untrusted input.** Credentials only go to the provider's own origin, redirects never downgrade to HTTP,
   XML and JSON are bounded, and `Debug` output never shows tokens or passwords. No `unsafe` code.
 - **Testable.** The `testing` feature ships in-memory servers for all five providers, so your own tests can drive real
@@ -24,10 +24,10 @@ the HTTP requests and parses the responses, and you send them with the HTTP clie
 
 ```toml
 [dependencies]
-cloudset = "0.2"
+cloudset = "0.3"
 
 [dev-dependencies]
-cloudset = { version = "0.2", features = ["testing"] }
+cloudset = { version = "0.3", features = ["testing"] }
 ```
 
 | Feature | Default | What it adds |
@@ -54,11 +54,12 @@ let entry = loop {
 
 - Every file operation returns an `Operation`: `stat`, `list`, `read`, `write`, `create_dir`, `rename`, `delete` and
   `revoke`.
-- When `Done.connection` is set, the connection changed (a refreshed token, for example): store the new one.
+- OAuth drivers should call `operation.take_connection()` after each advance and persist updates before sending the next
+  request. Successful operations also return any outstanding update in `Done.connection`.
 - `Connection::to_bytes` and `Connection::from_bytes` turn a connection into an opaque, versioned blob for the system
   keychain.
 - `cloudset::run(operation, |request| response)` drives an operation with a transport that cannot fail, such as the
-  in-memory test servers.
+  in-memory test servers. `cloudset::run_with_updates` also passes connection updates to a callback as they happen.
 
 ## Documentation
 
@@ -105,7 +106,8 @@ OAuth providers offer two scopes (`AccessScope`), and you choose:
 
 - `AppFolder`: only the folder the provider gives the app (Dropbox "Apps › your app" for an App folder app, OneDrive
   `special/approot`, and on Google Drive a visible folder named `OAuthClient::folder_name` in My Drive under the
-  `drive.file` scope). Paths are relative to that folder, and a leaked token reaches nothing else.
+  `drive.file` scope). Cloudset resolves paths relative to that folder. On Google Drive the grant applies to
+  app-authorized files, including files moved outside it.
 - `Full`: the whole drive; paths are relative to its root.
 
 `ProviderKind::access_scopes()` lists the scopes in order of preference; default to the first. WebDAV and Nextcloud only
@@ -120,8 +122,8 @@ backups. It deliberately leaves out:
   (16 MiB by default; raise it for larger files). Writes have no size cap: on Dropbox, OneDrive and Google Drive, files
   larger than `Limits::upload_chunk_bytes` (10 MiB by default) go up in pieces through an upload session, so the
   providers' single-request limits do not apply.
-- **Resuming after a transport failure.** If a request fails in your executor, the operation is abandoned; run it again
-  from the start. An unfinished upload never becomes visible, and the provider discards its session.
+- **Resuming after a transport failure.** Re-read the destination before restarting a mutation whose response was lost.
+  The server may already have committed it.
 - **Browsing features.** No search, sharing, thumbnails, quotas, trash or change feeds.
 - **Other providers.** iCloud Drive and S3-compatible storage are not supported.
 

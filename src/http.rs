@@ -172,16 +172,9 @@ fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a st
     headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.trim())
 }
 
-/// Keeps only scheme, host, and path, dropping the query string (it may carry a token).
+/// A pre-signed URL can carry a credential in its path as well as its query.
 fn redacted_url(url: &str) -> String {
-    match Url::parse(url) {
-        Ok(mut parsed) => {
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            parsed.to_string()
-        }
-        Err(_) => "<invalid url>".to_owned(),
-    }
+    Url::parse(url).map(|parsed| parsed.origin().ascii_serialization()).unwrap_or_else(|_| "<invalid url>".to_owned())
 }
 
 /// Resource limits. Data from the remote is checked against them before it is parsed.
@@ -206,9 +199,7 @@ pub struct Limits {
     /// provider accepts (a multiple of 4 MiB on Dropbox, 320 KiB on OneDrive and 256 KiB on Google Drive), but at least
     /// one such unit. Default: 10 MiB.
     ///
-    /// On OneDrive, [`Precondition::Matches`](crate::Precondition::Matches) is checked when the upload session is
-    /// created; a write by someone else during a chunked upload is overwritten. Raise this limit above your file sizes
-    /// if that window matters.
+    /// OneDrive rejects revision-matched writes that require an upload session.
     pub upload_chunk_bytes: usize,
 }
 
@@ -274,7 +265,7 @@ impl Origin {
     /// never accepted.
     pub(crate) fn admits(&self, url: &Url) -> bool {
         let other = Self::of(url);
-        if other.host != self.host {
+        if !matches!(url.scheme(), "http" | "https") || other.host != self.host {
             return false;
         }
         match (self.secure, other.secure) {
@@ -328,19 +319,34 @@ impl Exchange {
         }
         let location = response.header("Location").ok_or(CloudError::InvalidResponse("redirect without location"))?;
         let current = Url::parse(&self.request.url).map_err(|_| CloudError::InvalidResponse("request url"))?;
-        let target = current.join(location).map_err(|_| CloudError::InvalidResponse("redirect location"))?;
-        if !origin.admits(&target) || (current.scheme() == "https" && target.scheme() != "https") {
+        let mut target = current.join(location).map_err(|_| CloudError::InvalidResponse("redirect location"))?;
+        // Credentials in the URL would reach the transport as a second, server-chosen identity.
+        let has_userinfo = !target.username().is_empty() || target.password().is_some();
+        if has_userinfo || !origin.admits(&target) || (current.scheme() == "https" && target.scheme() != "https") {
             return Err(CloudError::InsecureRedirect);
+        }
+        // 303 answers with a different resource, to be fetched with GET. Following it for any other method would run
+        // a GET in place of the request and report that GET's status as the outcome of a write.
+        if response.status == 303 && self.request.method != Method::Get {
+            return Err(CloudError::InvalidResponse("unexpected redirect"));
+        }
+        target.set_fragment(None);
+        // Other codes keep the method and body (WebDAV methods must be kept on 301 / 302 too). A `Destination` on the
+        // old origin moves along, so a `MOVE` upgraded to HTTPS does not name a destination on another scheme.
+        for (name, value) in &mut self.request.headers {
+            if name.eq_ignore_ascii_case("Destination")
+                && let Ok(destination) = Url::parse(value)
+                && destination.origin() == current.origin()
+                && destination.origin() != target.origin()
+            {
+                let mut moved = target.clone();
+                moved.set_path(destination.path());
+                moved.set_query(destination.query());
+                *value = moved.to_string();
+            }
         }
         self.redirects += 1;
         self.request.url = target.to_string();
-        // 303 always becomes a GET without a body; other codes keep the method and body (WebDAV methods must be kept on 301 /
-        // 302 too).
-        if response.status == 303 {
-            self.request.method = Method::Get;
-            self.request.body.clear();
-            self.request.headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Content-Type"));
-        }
         Ok(Received::Resend(self.request.clone()))
     }
 }
@@ -403,8 +409,34 @@ mod tests {
         let mut exchange = Exchange::new(request(Method::Propfind, "https://example.com/dav/a"));
         let Received::Resend(next) = exchange.receive(redirect(301, "/dav/a/"), &origin, &limits).unwrap() else { panic!() };
         assert_eq!((next.method, next.url.as_str(), next.body.as_slice()), (Method::Propfind, "https://example.com/dav/a/", &b"x"[..]));
-        let Received::Resend(next) = exchange.receive(redirect(303, "b"), &origin, &limits).unwrap() else { panic!() };
-        assert_eq!((next.method, next.body.is_empty(), next.header("content-type")), (Method::Get, true, None));
+        // 303 points at another resource: never a stand-in for the outcome of a write.
+        assert_eq!(exchange.receive(redirect(303, "b"), &origin, &limits).err(), Some(CloudError::InvalidResponse("unexpected redirect")));
+        let mut get = Exchange::new(HttpRequest::new(Method::Get, "https://example.com/dav/a"));
+        let Received::Resend(next) = get.receive(redirect(303, "b#section"), &origin, &limits).unwrap() else { panic!() };
+        assert_eq!((next.method, next.url.as_str()), (Method::Get, "https://example.com/dav/b"), "the fragment is dropped");
+    }
+
+    #[test]
+    fn redirects_stay_on_http_and_carry_the_destination_along() {
+        let limits = Limits::default();
+        let http = origin("http://nas.local/");
+        for location in ["ws://nas.local/x", "ftp://nas.local:80/x", "app://nas.local:80/run"] {
+            assert!(!http.admits(&Url::parse(location).unwrap()), "{location}");
+            let mut exchange = Exchange::new(request(Method::Get, "http://nas.local/dav/a"));
+            assert_eq!(exchange.receive(redirect(307, location), &http, &limits).err(), Some(CloudError::InsecureRedirect));
+        }
+        let mut exchange = Exchange::new(request(Method::Get, "http://nas.local/dav/a"));
+        assert_eq!(exchange.receive(redirect(302, "http://user:pw@nas.local/x"), &http, &limits).err(), Some(CloudError::InsecureRedirect));
+
+        let mut moving = Exchange::new(
+            HttpRequest::new(Method::Move, "http://nas.local/dav/a").with_header("Destination", "http://nas.local/dav/b%20c?x=1"),
+        );
+        let Received::Resend(next) = moving.receive(redirect(301, "https://nas.local/dav/a"), &http, &limits).unwrap() else { panic!() };
+        assert_eq!((next.url.as_str(), next.header("Destination")), ("https://nas.local/dav/a", Some("https://nas.local/dav/b%20c?x=1")));
+        let mut elsewhere =
+            Exchange::new(HttpRequest::new(Method::Move, "http://nas.local/dav/a").with_header("Destination", "http://other.local/dav/b"));
+        let Received::Resend(next) = elsewhere.receive(redirect(301, "https://nas.local/dav/a"), &http, &limits).unwrap() else { panic!() };
+        assert_eq!(next.header("Destination"), Some("http://other.local/dav/b"), "only a destination on the old origin moves");
     }
 
     #[test]
@@ -437,7 +469,7 @@ mod tests {
 
     #[test]
     fn debug_hides_secrets() {
-        let mut request = request(Method::Get, "https://example.com/a?token=secret");
+        let mut request = request(Method::Get, "https://example.com/secret-path?token=secret");
         request.headers.push(("Authorization".into(), "Basic c2VjcmV0".into()));
         let text = format!("{request:?}");
         assert!(!text.contains("secret") && !text.contains("c2VjcmV0"), "{text}");

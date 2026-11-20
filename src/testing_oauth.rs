@@ -71,6 +71,11 @@ pub struct MemoryCloud {
     pub revoked: bool,
     /// Maximum children per page (for testing paging).
     pub page_size: usize,
+    /// The client secret the token endpoint requires with every code exchange and refresh, as Google does for
+    /// desktop clients. `None`: a public client, which must not send one.
+    pub client_secret: Option<String>,
+    /// OneDrive file `eTag`s are bare tokens, as on personal accounts, instead of quoted entity-tags.
+    pub bare_etags: bool,
     /// Before each of the next N downloads, "another device" modifies the target file first.
     pub modify_before_download: u8,
     issued: u32,
@@ -133,6 +138,8 @@ impl MemoryCloud {
             rotate_refresh_token: provider == FakeProvider::OneDrive,
             revoked: false,
             page_size: 2,
+            client_secret: None,
+            bare_etags: false,
             modify_before_download: 0,
             issued: 0,
             challenge: None,
@@ -336,7 +343,13 @@ impl MemoryCloud {
     fn token(&mut self, request: &HttpRequest) -> HttpResponse {
         assert_eq!(request.method, Method::Post);
         let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body).into_owned().collect();
-        assert!(!form.contains_key("client_secret"), "public clients do not send a secret");
+        match &self.client_secret {
+            None => assert!(!form.contains_key("client_secret"), "public clients do not send a secret"),
+            Some(secret) if form.get("client_secret") != Some(secret) => {
+                return response(400, json!({ "error": "invalid_request", "error_description": "client_secret is missing." }));
+            }
+            Some(_) => {}
+        }
         match form.get("grant_type").map(String::as_str) {
             Some("authorization_code") => {
                 let verifier = form.get("code_verifier").cloned().unwrap_or_default();
@@ -562,7 +575,7 @@ impl MemoryCloud {
                 "id": id,
                 "name": name,
                 "size": data.len(),
-                "eTag": format!("\"{{ITEM}},{version}\""),
+                "eTag": if self.bare_etags { format!("aSVRFTSE{version}") } else { format!("\"{{ITEM}},{version}\"") },
                 "lastModifiedDateTime": "2026-10-28T09:12:40Z",
                 "file": { "mimeType": "application/octet-stream" },
                 "@microsoft.graph.downloadUrl": format!(
@@ -618,6 +631,31 @@ impl MemoryCloud {
             }
             return response(200, json!({ "owner": { "user": { "displayName": "Alice Example" } } }));
         }
+        // An item addressed by ID can be deleted, with `If-Match` for one version of it.
+        if let Some(id) = url.path().strip_prefix("/v1.0/me/drive/items/").filter(|id| !id.contains('/'))
+            && request.method == Method::Delete
+        {
+            let id = percent_decode_str(id).decode_utf8_lossy().into_owned();
+            let Some(item) = Self::graph_key(&id).and_then(|key| self.graph_item(&key).map(|item| (key, item))) else {
+                return graph_error(404, "itemNotFound");
+            };
+            if request.header("If-Match").is_some_and(|expected| item.1.get("eTag").and_then(Value::as_str) != Some(expected)) {
+                return graph_error(412, "notAllowed");
+            }
+            self.nodes.retain(|candidate, _| !candidate.starts_with(&item.0));
+            return HttpResponse { status: 204, headers: Vec::new(), body: Vec::new() };
+        }
+        // Children are created under an item addressed by ID.
+        if let Some(id) = url.path().strip_prefix("/v1.0/me/drive/items/").and_then(|rest| rest.strip_suffix("/children"))
+            && request.method == Method::Post
+        {
+            let id = percent_decode_str(id).decode_utf8_lossy().into_owned();
+            let Some(key) = Self::graph_key(&id) else { return graph_error(404, "itemNotFound") };
+            if self.granted != Some(AccessScope::Full) && !key.starts_with(&split(APP_FOLDER)) {
+                return graph_error(403, "accessDenied");
+            }
+            return self.graph_create_folder(&key, request);
+        }
         let Some((approot, relative, suffix)) = Self::graph_target(url) else { return graph_error(400, "invalidRequest") };
         let mut key = if approot {
             // approot is created on first access; both scopes can reach it.
@@ -644,8 +682,10 @@ impl MemoryCloud {
                 None => graph_error(404, "itemNotFound"),
             },
             (Method::Get, "children") => {
-                if !matches!(self.nodes.get(&key), Some(Node::Dir)) {
-                    return graph_error(404, "itemNotFound");
+                match self.nodes.get(&key) {
+                    Some(Node::Dir) => {}
+                    Some(Node::File { .. }) => return graph_error(422, "notSupported"),
+                    None => return graph_error(404, "itemNotFound"),
                 }
                 let children = self.children(&key);
                 let offset: usize = query.get("$skiptoken").and_then(|token| token.parse().ok()).unwrap_or(0);
@@ -675,7 +715,8 @@ impl MemoryCloud {
             (Method::Patch, "") => {
                 let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
                 if !self.nodes.contains_key(&key) {
-                    return graph_error(404, "itemNotFound");
+                    // Not a 404 on the real service.
+                    return graph_error(400, "invalidRequest");
                 }
                 let parent = body.pointer("/parentReference/id").and_then(Value::as_str).and_then(Self::graph_key);
                 let Some(parent) = parent.filter(|parent| matches!(self.nodes.get(parent), Some(Node::Dir))) else {
@@ -689,20 +730,10 @@ impl MemoryCloud {
                 self.move_nodes(&key, &target);
                 response(200, self.graph_item(&target).unwrap_or_default())
             }
-            (Method::Post, "children") => {
-                if !matches!(self.nodes.get(&key), Some(Node::Dir)) {
-                    return graph_error(404, "itemNotFound");
-                }
-                let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
-                let name = body.get("name").and_then(Value::as_str).unwrap_or_default();
-                let mut child = key.clone();
-                child.push(name.to_owned());
-                if self.nodes.contains_key(&child) {
-                    return graph_error(409, "nameAlreadyExists");
-                }
-                self.nodes.insert(child.clone(), Node::Dir);
-                response(201, self.graph_item(&child).unwrap_or_default())
-            }
+            // As on the real service (checked against a personal account in November 2026): the app folder does not
+            // take new children by path, neither at its root nor below it.
+            (Method::Post, "children") if approot => graph_error(400, "invalidRequest"),
+            (Method::Post, "children") => self.graph_create_folder(&key, request),
             (Method::Delete, "") => {
                 if self.nodes.remove(&key).is_none() {
                     return graph_error(404, "itemNotFound");
@@ -714,6 +745,21 @@ impl MemoryCloud {
         }
     }
 
+    fn graph_create_folder(&mut self, key: &[String], request: &HttpRequest) -> HttpResponse {
+        if !matches!(self.nodes.get(key), Some(Node::Dir)) {
+            return graph_error(404, "itemNotFound");
+        }
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+        let name = body.get("name").and_then(Value::as_str).unwrap_or_default();
+        let mut child = key.to_vec();
+        child.push(name.to_owned());
+        if self.nodes.contains_key(&child) {
+            return graph_error(409, "nameAlreadyExists");
+        }
+        self.nodes.insert(child.clone(), Node::Dir);
+        response(201, self.graph_item(&child).unwrap_or_default())
+    }
+
     /// The error for a write that `If-Match` or `conflictBehavior=fail` rules out, if any.
     fn graph_refuses(&self, key: &[String], behavior: &str, if_match: Option<&str>) -> Option<HttpResponse> {
         let existing = self.graph_item(key);
@@ -721,7 +767,7 @@ impl MemoryCloud {
             match &existing {
                 None => return Some(graph_error(404, "itemNotFound")),
                 Some(item) if item.get("eTag").and_then(Value::as_str) != Some(expected) => {
-                    return Some(graph_error(412, "resourceModified"));
+                    return Some(graph_error(412, "notAllowed"));
                 }
                 Some(_) => {}
             }
@@ -731,6 +777,12 @@ impl MemoryCloud {
 
     fn graph_upload(&mut self, key: Vec<String>, query: &HashMap<String, String>, if_match: Option<&str>, data: Vec<u8>) -> HttpResponse {
         let behavior = query.get("@microsoft.graph.conflictBehavior").map_or("replace", String::as_str);
+        // As on the real service (checked against a personal account in November 2026): a folder cannot take
+        // content, and `If-Match` is ignored when there is no file, which is then created.
+        if matches!(self.nodes.get(&key), Some(Node::Dir)) {
+            return graph_error(501, "notSupported");
+        }
+        let if_match = if_match.filter(|_| self.nodes.contains_key(&key));
         if let Some(refused) = self.graph_refuses(&key, behavior, if_match) {
             return refused;
         }

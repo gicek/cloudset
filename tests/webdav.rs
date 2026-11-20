@@ -70,14 +70,54 @@ fn conditional_writes() {
 }
 
 #[test]
-fn weak_etags_fall_back_to_check_then_write() {
+fn weak_etags_do_not_authorize_writes_or_label_unconditional_reads() {
     let mut server = MemoryDav::new(AUTH);
     server.weak_etags = true;
-    let weak = write(&mut server, "notes", b"1", Precondition::Absent).unwrap().revision.unwrap();
-    assert!(weak.as_str().starts_with("W/"));
-    let next = write(&mut server, "notes", b"2", Precondition::Matches(weak.clone())).unwrap().revision.unwrap();
-    assert_eq!(write(&mut server, "notes", b"3", Precondition::Matches(weak)), Err(CloudError::PreconditionFailed));
-    assert_eq!(read(&mut server, "notes").unwrap().unwrap().entry.revision, Some(next), "reads with a weak ETag skip If-Match");
+    let written = write(&mut server, "notes", b"1", Precondition::Absent).unwrap();
+    assert_eq!(written.revision, None);
+    let weak = run(&mut server, client().stat(path("notes"))).unwrap().unwrap().revision.unwrap();
+    let requests = server.requests.len();
+    assert_eq!(write(&mut server, "notes", b"2", Precondition::Matches(weak)), Err(CloudError::UnsupportedPrecondition));
+    assert_eq!(server.requests.len(), requests);
+    server.modify_before_get = 1;
+    let file = read(&mut server, "notes").unwrap().unwrap();
+    assert_eq!(file.data, b"1+");
+    assert_eq!((file.entry.size, file.entry.modified_at, file.entry.revision), (Some(2), None, None));
+}
+
+#[test]
+fn a_second_writer_cannot_supply_the_revision_of_our_write() {
+    let mut server = MemoryDav::new(AUTH);
+    let result = cloudset::run(client().write(path("notes"), b"first".to_vec(), Precondition::Absent).as_mut(), |request| {
+        let put = request.method == cloudset::Method::Put;
+        let response = server.handle(request);
+        if put {
+            server.put_external("notes", b"second");
+        }
+        response
+    });
+    assert_eq!(result.unwrap_err(), CloudError::CommitUnconfirmed);
+    assert_eq!(server.data("notes").as_deref(), Some(b"second".as_slice()));
+}
+
+#[test]
+fn failed_readback_reports_an_unconfirmed_commit() {
+    let mut server = MemoryDav::new(AUTH);
+    let result = cloudset::run(client().write(path("notes"), b"saved".to_vec(), Precondition::Absent).as_mut(), |request| {
+        if request.method == cloudset::Method::Propfind { HttpResponse::new(503) } else { server.handle(request) }
+    });
+    assert_eq!(result.unwrap_err(), CloudError::CommitUnconfirmed);
+    assert_eq!(server.data("notes").as_deref(), Some(b"saved".as_slice()));
+}
+
+#[test]
+fn writes_larger_than_the_read_limit_return_only_acknowledged_metadata() {
+    let mut server = MemoryDav::new(AUTH);
+    let config = ClientConfig::new("test").with_limits(cloudset::Limits::default().with_max_body_bytes(4));
+    let client = client().with_config(config);
+    let written = run(&mut server, client.write(path("notes"), b"large".to_vec(), Precondition::Absent)).unwrap();
+    assert_eq!((written.size, written.revision, written.modified_at), (Some(5), None, None));
+    assert_eq!(server.requests.len(), 1);
 }
 
 #[test]
@@ -175,4 +215,75 @@ fn mkcol_405_is_checked_before_treating_it_as_existing() {
     server.put_external("home/file", b"x");
     server.mkcol_forbidden_in.push("home".into());
     assert_eq!(run(&mut server, client().create_dir(path("home/file"))), Err(CloudError::Forbidden), "a file has that name");
+}
+
+#[test]
+fn refuses_to_mutate_the_connection_root() {
+    for mut operation in
+        [client().delete(RemotePath::root()), cloudset::map(client().write(RemotePath::root(), vec![1], Precondition::None), |_| ())]
+    {
+        assert_eq!(operation.advance(None).unwrap_err(), CloudError::InvalidPath);
+    }
+}
+
+fn multistatus(responses: &str) -> HttpResponse {
+    HttpResponse::new(207).with_body(format!(r#"<d:multistatus xmlns:d="DAV:">{responses}</d:multistatus>"#).into_bytes())
+}
+
+fn dav_response(href: &str, is_dir: bool) -> String {
+    let kind = if is_dir { "<d:collection/>" } else { "" };
+    format!(
+        "<d:response><d:href>{href}</d:href><d:propstat><d:prop><d:resourcetype>{kind}</d:resourcetype></d:prop>\
+         <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+    )
+}
+
+fn scripted<T>(mut operation: cloudset::BoxOperation<T>, response: HttpResponse) -> Result<T, CloudError> {
+    cloudset::run(operation.as_mut(), |_| response.clone()).map(|done| done.value)
+}
+
+/// A listing must be about the directory that was asked for: hrefs that do not map onto the endpoint, a file, or a
+/// server that ignores `Depth: 1` must not read as "this directory is empty" or add entries from elsewhere.
+#[test]
+fn list_only_trusts_answers_about_the_directory() {
+    let base = Endpoint::parse(BASE, Transport::RequireHttps).unwrap();
+    let prefix = url::Url::parse(base.as_str()).unwrap().path().to_owned();
+    let elsewhere = multistatus(&(dav_response("/other/prefix/x/", true) + &dav_response("/other/prefix/x/a.txt", false)));
+    assert_eq!(scripted(client().list(path("x")), elsewhere), Err(CloudError::InvalidResponse("missing entry")));
+
+    let a_file = multistatus(&dav_response(&format!("{prefix}x"), false));
+    assert_eq!(scripted(client().list(path("x")), a_file), Err(CloudError::InvalidResponse("not a directory")));
+
+    let gone = multistatus(&format!("<d:response><d:href>{prefix}x/</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>"));
+    assert_eq!(scripted(client().list(path("x")), gone.clone()), Err(CloudError::NotFound));
+    assert_eq!(scripted(client().stat(path("x")), gone), Ok(None), "a 404 inside the multistatus is a missing file");
+
+    let deep = multistatus(
+        &[
+            dav_response(&format!("{prefix}x/"), true),
+            dav_response(&format!("{prefix}x/a.txt"), false),
+            dav_response(&format!("{prefix}x/y/z.txt"), false),
+            dav_response(&format!("{prefix}other.txt"), false),
+            format!("<d:response><d:href>{prefix}x/hidden</d:href><d:status>HTTP/1.1 403 Forbidden</d:status></d:response>"),
+        ]
+        .concat(),
+    );
+    let listed = scripted(client().list(path("x")), deep).unwrap();
+    assert_eq!(listed.iter().map(|entry| entry.path.to_string()).collect::<Vec<_>>(), ["x/a.txt"]);
+}
+
+/// A 303 would turn the request into a GET, whose 200 says nothing about the delete or the new directory.
+#[test]
+fn a_see_other_redirect_is_not_the_result_of_a_write() {
+    for operation in [client().delete(path("a.txt")), client().create_dir(path("dir"))] {
+        let mut operation = operation;
+        let mut requests = 0;
+        let result = cloudset::run(operation.as_mut(), |_| {
+            requests += 1;
+            if requests == 1 { HttpResponse::new(303).with_header("Location", "/login") } else { HttpResponse::new(200) }
+        });
+        assert_eq!(result.err(), Some(CloudError::InvalidResponse("unexpected redirect")));
+        assert_eq!(requests, 1);
+        assert_eq!(operation.advance(Some(HttpResponse::new(204))).err(), Some(CloudError::OutOfOrder), "an error ends the operation");
+    }
 }
