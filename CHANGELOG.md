@@ -30,6 +30,12 @@ variants only if they had no fallback arm, which `#[non_exhaustive]` already req
 - Testing: `testing::synology::MemorySynology`, an in-memory device with QuickConnect control hosts in both regions.
 - Example: `synology_memory` (QuickConnect in mainland China, relay fallback, two-step sign-in).
 
+### Security
+
+- Requires `url` 2.5.9 ([RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592): stack overflow in
+  `Url::origin()` on nested `blob:` URLs). Cloudset only takes the origin of URLs it built or already checked to be
+  `http(s)`, but the minimum version now excludes the affected releases.
+
 ## [0.3.0] - 2026-11-20
 
 Makes write guarantees explicit: a condition a provider cannot enforce is refused before anything is sent, and a write
