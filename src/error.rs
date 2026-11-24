@@ -41,6 +41,13 @@ pub enum CloudError {
         /// The status code.
         status: u16,
     },
+    /// The provider's API reported an error of its own that has no closer match (a Synology Web API error code, which
+    /// is not an HTTP status even where the numbers overlap).
+    #[error("provider error code {code}")]
+    Provider {
+        /// The provider's error code.
+        code: i64,
+    },
     /// The response does not follow the protocol; carries a short reason that contains no remote data.
     #[error("invalid response: {0}")]
     InvalidResponse(&'static str),
@@ -69,6 +76,10 @@ pub enum CloudError {
     /// The user denied or cancelled on the authorization page, or the provider returned an error.
     #[error("authorization denied")]
     AuthorizationDenied,
+    /// The Synology account uses two-step verification: sign in again with the one-time code from the authenticator app.
+    /// Also reported when the code was wrong or expired.
+    #[error("one-time code required")]
+    OtpRequired,
     /// Persisted connection data cannot be read.
     #[error("invalid stored connection")]
     InvalidConnection,

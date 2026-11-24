@@ -5,16 +5,16 @@ is for when you need to know exactly what goes over the wire.
 
 ## Overview
 
-| | WebDAV / Nextcloud | Dropbox | OneDrive | Google Drive |
-| --- | --- | --- | --- | --- |
-| Sign-in | User name and password, or Nextcloud Login Flow v2 | OAuth 2.0 + PKCE | OAuth 2.0 + PKCE | OAuth 2.0 + PKCE |
-| Access scopes | `Full` | `AppFolder`, `Full` | `AppFolder`, `Full` | `AppFolder`, `Full` |
-| Version (`Revision`) | `getetag` from `PROPFIND` | `rev` | `eTag` | `headRevisionId` |
-| Conditional writes | Strong ETag for `Matches`; `If-None-Match: *` for `Absent` | Upload `mode` | `Matches` for single-request uploads only; `Absent` uses `conflictBehavior=fail` | Both strict conditions return `UnsupportedPrecondition` |
-| Large uploads | One `PUT` | Upload session | Upload session | Resumable upload |
-| Move or rename | `MOVE`, `Overwrite: F` | `files/move_v2` | `PATCH` with `parentReference` | `PATCH` with `addParents` / `removeParents` |
-| Missing parent on write | `NotFound` | Created | Created | Created |
-| `revoke` | Nextcloud deletes the app password; WebDAV does nothing | Revokes the token | Nothing (no endpoint) | Revokes the whole grant |
+| | WebDAV / Nextcloud | Synology | Dropbox | OneDrive | Google Drive |
+| --- | --- | --- | --- | --- | --- |
+| Sign-in | User name and password, or Nextcloud Login Flow v2 | DSM password, one-time code with two-step verification | OAuth 2.0 + PKCE | OAuth 2.0 + PKCE | OAuth 2.0 + PKCE |
+| Access scopes | `Full` | `Full` (a root folder) | `AppFolder`, `Full` | `AppFolder`, `Full` | `AppFolder`, `Full` |
+| Version (`Revision`) | `getetag` from `PROPFIND` | None | `rev` | `eTag` | `headRevisionId` |
+| Conditional writes | Strong ETag for `Matches`; `If-None-Match: *` for `Absent` | `Absent` only (upload without `overwrite`) | Upload `mode` | `Matches` for single-request uploads only; `Absent` uses `conflictBehavior=fail` | Both strict conditions return `UnsupportedPrecondition` |
+| Large uploads | One `PUT` | One multipart `POST` | Upload session | Upload session | Resumable upload |
+| Move or rename | `MOVE`, `Overwrite: F` | `Rename`, or a `CopyMove` task | `files/move_v2` | `PATCH` with `parentReference` | `PATCH` with `addParents` / `removeParents` |
+| Missing parent on write | `NotFound` | `NotFound` | Created | Created | Created |
+| `revoke` | Nextcloud deletes the app password; WebDAV does nothing | Ends the session | Revokes the token | Nothing (no endpoint) | Revokes the whole grant |
 
 Every provider: `rename` requires the destination's parent to exist and the destination to be free; on Google Drive a
 race may leave the move unconfirmed.
@@ -44,6 +44,71 @@ race may leave the move unconfirmed.
   the user entered (an upgrade from HTTP to HTTPS on the same host is allowed, and the HTTPS address is then used for
   the connection). Files are addressed under `remote.php/dav/files/<user ID>/`; if the user ID cannot be looked up
   after the app password was issued, the connection uses `remote.php/webdav/`.
+
+## Synology
+
+DSM 7 through the File Station Web API (`webapi/entry.cgi`, `SYNO.API.Auth` version 6 and `SYNO.FileStation.*`). The
+DSM user needs the File Station application permission.
+
+- **Sign-in** (`synology::sign_in`) sends the DSM user name and password, plus `otp_code` and `enable_device_token=yes`
+  when a one-time code is given. Error 403 or 404 becomes `OtpRequired`, 400 `ReauthRequired`, and a disabled account,
+  blocked address or expired password `Forbidden`. The sign-in then checks the root folder exists.
+- **Sessions** go to DSM as `_sid` in the query string; never log query strings. When DSM reports a session expired or
+  replaced, or used from another client IP (106, 107, 119, 150), the driver signs in again with the stored password and
+  the trusted-device token (`did`, so no one-time code) and replays the request once. The renewed connection comes back
+  through `take_connection` and `Done::connection`. A sign-in that would need a code reports `ReauthRequired`; a session
+  refused again right after signing in reports `Provider { code }`. `Connection::with_endpoint` drops the session when
+  the origin changes.
+- **Paths** are `/<root folder>/<path>`, sent as JSON arrays, so names may contain commas. A name with a double quote
+  cannot be uploaded (`InvalidPath`).
+- **No version identifier**: entries have no `revision`. Reads look the file up before and after the download; when size
+  or modification time changed, they download the newer version (three downloads at most, then `PreconditionFailed`).
+  Modification times have whole seconds, so a rewrite of the same size within one second goes unnoticed.
+- **Writes** are one multipart upload with `create_parents=false`. `Absent` leaves out `overwrite`, so DSM refuses an
+  existing file (1805, `PreconditionFailed`); `None` sends `overwrite=true`; `Matches` returns `UnsupportedPrecondition`
+  before anything is sent. The written file is looked up afterwards; if that fails, `CommitUnconfirmed`.
+- **Directories**: `CreateFolder` with `force_parent=false`. On an error, a lookup tells an existing folder (success)
+  from a file in the way (`Forbidden`).
+- **Moves** check the source, the destination and its parent first. Within a folder they use `Rename`; between folders a
+  `CopyMove` task without `overwrite`, then a `Rename` when the name changes. The item passes through
+  `<destination folder>/<old name>`, which must be free. The task is polled back to back (the crate cannot wait), at
+  most 600 times; after that, or when the second step fails, the move reports `CommitUnconfirmed` and the item may be
+  at the source, the intermediate path or the destination. A task that fails for a file is mapped (a destination taken
+  in the meantime is `PreconditionFailed`); for a folder, which may have moved in part, it is `CommitUnconfirmed`.
+- **Errors** without a closer match are `Provider { code }` with the Web API error code, never `Server`: those codes
+  overlap HTTP statuses without meaning them. `Server` is kept for actual HTTP errors.
+- **`revoke`** ends the session (`logout`) and hands back the connection without it. The stored password still signs in;
+  delete the stored connection to forget it. The trusted-device token stays until the user removes the device in DSM.
+
+### QuickConnect
+
+`synology::quickconnect` follows the steps of Synology's QuickConnect web portal:
+
+1. `resolve` posts `get_server_info` (service `mainapp_https`, one entry per request: `Serv.php` answers 413 to larger
+   bodies) to `global.quickconnect.to`, or `global.quickconnect.cn` with `Region::ChinaMainland`. An answer with
+   `sites` (the device is registered in another region) is followed, only to hosts under `quickconnect.to` and
+   `quickconnect.cn`; an error status moves on to the other region's global host. At most six control hosts are asked.
+   No control host knowing the ID is `NotFound`.
+2. Candidates are HTTPS only, local first: SmartDNS local names (`<ip>.<id>.direct.quickconnect.to`) and private
+   interface IPs on the DSM port, then FQDN, DDNS, the SmartDNS host and public SmartDNS names (`syn4-…`), and the
+   public IPs, each on the forwarded port and then the DSM port.
+3. `Resolution::probe` sends `GET /webman/pingpong.cgi?action=cors&quickconnect=true` without credentials and without
+   following redirects; it succeeds only when `ezid` is the MD5 of the device's server ID. That rules out another
+   Synology device at a stale address, but the server ID is public: a probe is not authentication. TLS with a
+   certificate the system trusts protects the password; never pin a certificate because a probe succeeded.
+4. `Resolution::request_relay` posts `request_tunnel` to the device's control host (`env.control_host`) and returns
+   `https://<id>.<relay_region>.<domain>/`, the control host's domain first. Relays have certificates the system
+   trusts.
+
+Mainland China has its own control hosts (`*.quickconnect.cn`) and relays (`<region>.quickconnect.cn`), and
+`quickconnect.to` is often slow or blocked there. Pick the region from where the user is or what they typed
+(`Region::from_address`), store `Resolution::region` with the connection, and resolve again with `Region::other` after
+a transport failure. A device registered in China is found from the global host too, through `sites`.
+
+Checked in November 2026 against a DSM 7 device registered in mainland China, from a client outside its network: the
+global host redirected to the China control host, no direct address answered, the `.cn` relay answered as the device
+(its `.to` twin did not), and sign-in, listing, uploads with `Absent`, moves and session renewal after `revoke` worked
+through it.
 
 ## OAuth providers
 

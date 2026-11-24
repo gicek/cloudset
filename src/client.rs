@@ -8,7 +8,7 @@ use crate::operation::BoxOperation;
 use crate::operation::Ready;
 use crate::path::RemotePath;
 use crate::webdav::Dav;
-use crate::{dropbox, gdrive, nextcloud, onedrive};
+use crate::{dropbox, gdrive, nextcloud, onedrive, synology};
 
 /// Settings shared by every request of a [`Client`].
 ///
@@ -107,6 +107,7 @@ impl Client {
             ProviderKind::Dropbox => dropbox::stat(&self.connection, &self.config, path),
             ProviderKind::OneDrive => onedrive::stat(&self.connection, &self.config, path),
             ProviderKind::GoogleDrive => gdrive::stat(&self.connection, &self.config, path),
+            ProviderKind::Synology => synology::stat(&self.connection, &self.config, path),
         }
     }
 
@@ -117,6 +118,7 @@ impl Client {
             ProviderKind::Dropbox => dropbox::list(&self.connection, &self.config, dir),
             ProviderKind::OneDrive => onedrive::list(&self.connection, &self.config, dir),
             ProviderKind::GoogleDrive => gdrive::list(&self.connection, &self.config, dir),
+            ProviderKind::Synology => synology::list(&self.connection, &self.config, dir),
         }
     }
 
@@ -128,6 +130,7 @@ impl Client {
             ProviderKind::Dropbox => dropbox::read(&self.connection, &self.config, path),
             ProviderKind::OneDrive => onedrive::read(&self.connection, &self.config, path),
             ProviderKind::GoogleDrive => gdrive::read(&self.connection, &self.config, path),
+            ProviderKind::Synology => synology::read(&self.connection, &self.config, path),
         }
     }
 
@@ -139,6 +142,7 @@ impl Client {
             ProviderKind::GoogleDrive => matches!(precondition, Precondition::None),
             ProviderKind::OneDrive => onedrive::supports_write_precondition(&self.config, size, precondition),
             ProviderKind::WebDav | ProviderKind::Nextcloud => !matches!(precondition, Precondition::Matches(rev) if !rev.is_strong_etag()),
+            ProviderKind::Synology => synology::supports_write_precondition(precondition),
             ProviderKind::Dropbox => true,
         }
     }
@@ -164,6 +168,7 @@ impl Client {
             ProviderKind::Dropbox => dropbox::write(&self.connection, &self.config, path, data, precondition),
             ProviderKind::OneDrive => onedrive::write(&self.connection, &self.config, path, data, precondition),
             ProviderKind::GoogleDrive => gdrive::write(&self.connection, &self.config, path, data, precondition),
+            ProviderKind::Synology => synology::write(&self.connection, &self.config, path, data, precondition),
         }
     }
 
@@ -175,6 +180,7 @@ impl Client {
             ProviderKind::Dropbox => dropbox::create_dir(&self.connection, &self.config, path),
             ProviderKind::OneDrive => onedrive::create_dir(&self.connection, &self.config, path),
             ProviderKind::GoogleDrive => gdrive::create_dir(&self.connection, &self.config, path),
+            ProviderKind::Synology => synology::create_dir(&self.connection, &self.config, path),
         }
     }
 
@@ -188,6 +194,7 @@ impl Client {
             ProviderKind::Dropbox => dropbox::delete(&self.connection, &self.config, path),
             ProviderKind::OneDrive => onedrive::delete(&self.connection, &self.config, path),
             ProviderKind::GoogleDrive => gdrive::delete_path(&self.connection, &self.config, path),
+            ProviderKind::Synology => synology::delete(&self.connection, &self.config, path),
         }
     }
 
@@ -207,17 +214,21 @@ impl Client {
             ProviderKind::Dropbox => dropbox::rename(&self.connection, &self.config, from, to),
             ProviderKind::OneDrive => onedrive::rename(&self.connection, &self.config, from, to),
             ProviderKind::GoogleDrive => gdrive::rename(&self.connection, &self.config, from, to),
+            ProviderKind::Synology => synology::rename(&self.connection, &self.config, from, to),
         }
     }
 
     /// Best-effort revocation of the server-side authorization: Nextcloud deletes the app password, Dropbox and Google
-    /// revoke the token (on Google, the whole grant). WebDAV and OneDrive have no revocation endpoint (on OneDrive the user removes the app under "App access"
-    /// at account.live.com).
+    /// revoke the token (on Google, the whole grant), and Synology ends the session and hands back the connection
+    /// without it; the stored password could still sign in again, so delete the stored connection to forget it. WebDAV
+    /// and OneDrive have no revocation endpoint (on OneDrive the user removes the app under "App access" at
+    /// account.live.com).
     pub fn revoke(&self) -> BoxOperation<()> {
         match self.connection.provider() {
             ProviderKind::WebDav | ProviderKind::Nextcloud => nextcloud::revoke(&self.connection, &self.config),
             ProviderKind::Dropbox => dropbox::revoke(&self.connection, &self.config),
             ProviderKind::GoogleDrive => gdrive::revoke(&self.connection, &self.config),
+            ProviderKind::Synology => synology::revoke(&self.connection, &self.config),
             ProviderKind::OneDrive => Box::new(Ready::ok(())),
         }
     }

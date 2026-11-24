@@ -113,7 +113,7 @@ pub(crate) fn endpoints(provider: ProviderKind) -> Result<Endpoints, CloudError>
         ProviderKind::GoogleDrive => {
             Ok(Endpoints { authorize: "https://accounts.google.com/o/oauth2/v2/auth", token: "https://oauth2.googleapis.com/token" })
         }
-        ProviderKind::WebDav | ProviderKind::Nextcloud => Err(CloudError::InvalidConnection),
+        ProviderKind::WebDav | ProviderKind::Nextcloud | ProviderKind::Synology => Err(CloudError::InvalidConnection),
     }
 }
 
@@ -238,7 +238,7 @@ pub fn begin(provider: ProviderKind, access: AccessScope, client: OAuthClient, r
                     query.append_pair("scope", scope);
                 }
             }
-            ProviderKind::WebDav | ProviderKind::Nextcloud => {}
+            ProviderKind::WebDav | ProviderKind::Nextcloud | ProviderKind::Synology => {}
         }
     }
     Ok(Authorization { provider, access, client, verifier, state, url: url.into() })

@@ -4,6 +4,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
+Adds Synology DSM 7 as a provider, reached directly or through QuickConnect, including devices and users in mainland
+China. Existing providers behave as before; matches on `ProviderKind` and `CloudError` need an arm for the new
+variants only if they had no fallback arm, which `#[non_exhaustive]` already requires.
+
+### Added
+
+- Synology DSM 7 as a provider (`ProviderKind::Synology`), through the File Station API. `synology::sign_in` signs in
+  with the DSM password and, for accounts with two-step verification, a one-time code; DSM then trusts the device, so
+  expired sessions renew without the user. Paths are relative to a root folder (a shared folder and a path inside it).
+  `Precondition::Absent` is enforced by DSM; `Precondition::Matches` returns `UnsupportedPrecondition`, because File
+  Station has no version identifier.
+- `synology::quickconnect` finds a device by its QuickConnect ID: `resolve` asks the control hosts and follows regional
+  redirects, `Resolution::probe` checks that an address answers as this exact device, and `Resolution::request_relay`
+  opens Synology's relay. `Region::ChinaMainland` starts at `global.quickconnect.cn` and keeps relays on
+  `quickconnect.cn`.
+- `Connection::with_endpoint` moves a Synology connection to another address of the same device (never from HTTPS to
+  plain HTTP; the session and a pinned certificate are dropped when the origin changes); `Connection::quickconnect`
+  and `Connection::root_folder` describe it.
+- `CloudError::OtpRequired`: a Synology sign-in needs a one-time code, or the one given was wrong.
+- `CloudError::Provider { code }`: an error code from the provider's own API that has no closer match; unlike
+  `Server`, it is not an HTTP status.
+- Testing: `testing::synology::MemorySynology`, an in-memory device with QuickConnect control hosts in both regions.
+- Example: `synology_memory` (QuickConnect in mainland China, relay fallback, two-step sign-in).
+
 ## [0.3.0] - 2026-11-20
 
 Makes write guarantees explicit: a condition a provider cannot enforce is refused before anything is sent, and a write
@@ -181,6 +207,7 @@ This release changes the public API; see "Changed" for the migration.
 - Nextcloud: Login Flow v2 (`begin_login` / `poll_login`, looking up the user ID for the WebDAV address) and revocation of
   the app password.
 
-[Unreleased]: https://github.com/gicek/cloudset/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/gicek/cloudset/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/gicek/cloudset/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gicek/cloudset/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gicek/cloudset/releases/tag/v0.2.0

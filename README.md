@@ -6,33 +6,37 @@
 [![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue)](#minimum-supported-rust-version)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-One file API for WebDAV, Nextcloud, Dropbox, OneDrive and Google Drive, written as a sans-IO library: cloudset builds
-the HTTP requests and parses the responses, and you send them with the HTTP client you already use.
+One file API for WebDAV, Nextcloud, Synology (with QuickConnect), Dropbox, OneDrive and Google Drive, written as a
+sans-IO library: cloudset builds the HTTP requests and parses the responses, and you send them with the HTTP client you
+already use.
 
 - **Bring your own transport.** No sockets, no async runtime, no TLS stack. Operations are plain state machines, so the
   same code runs with `ureq`, `reqwest`, `hyper`, a platform HTTP API over FFI, or an in-memory test server.
 - **Conditional writes.** Check `Client::supports_write_precondition` for the payload and revision. A strict write
   returns `UnsupportedPrecondition` if the backend cannot enforce it. See the [provider matrix](docs/PROVIDERS.md).
 - **Sign-in included.** OAuth 2.0 with PKCE for Dropbox, OneDrive and Google Drive, with a custom scheme or loopback
-  redirect, and Nextcloud Login Flow v2. Tokens refresh automatically.
+  redirect, Nextcloud Login Flow v2, and Synology DSM with two-step verification. Tokens and sessions renew
+  automatically.
+- **Synology QuickConnect.** Finds a NAS by its QuickConnect ID on the local network, over the internet or through
+  Synology's relay, including devices and users in mainland China (`quickconnect.cn`).
 - **Careful with untrusted input.** Credentials only go to the provider's own origin, redirects never downgrade to HTTP,
   XML and JSON are bounded, and `Debug` output never shows tokens or passwords. No `unsafe` code.
-- **Testable.** The `testing` feature ships in-memory servers for all five providers, so your own tests can drive real
+- **Testable.** The `testing` feature ships in-memory servers for every provider, so your own tests can drive real
   sign-ins, conflicts and token refreshes without a network.
 
 ## Installation
 
 ```toml
 [dependencies]
-cloudset = "0.3"
+cloudset = "0.4"
 
 [dev-dependencies]
-cloudset = { version = "0.3", features = ["testing"] }
+cloudset = { version = "0.4", features = ["testing"] }
 ```
 
 | Feature | Default | What it adds |
 | --- | --- | --- |
-| `testing` | off | `cloudset::testing`: in-memory WebDAV (`MemoryDav`) and Dropbox, OneDrive and Google Drive (`testing::oauth::MemoryCloud`) servers. For tests only. |
+| `testing` | off | `cloudset::testing`: in-memory WebDAV (`MemoryDav`), Synology with QuickConnect (`testing::synology::MemorySynology`), and Dropbox, OneDrive and Google Drive (`testing::oauth::MemoryCloud`) servers. For tests only. |
 
 ## Quick start
 
@@ -76,6 +80,7 @@ let entry = loop {
 | [`webdav_memory`](examples/webdav_memory.rs) | Every file operation, conditional writes, storing a connection | `cargo run --example webdav_memory --features testing` |
 | [`oauth_memory`](examples/oauth_memory.rs) | PKCE sign-in, automatic token refresh, revocation | `cargo run --example oauth_memory --features testing` |
 | [`custom_operation`](examples/custom_operation.rs) | A composite operation built with `Subtask` | `cargo run --example custom_operation --features testing` |
+| [`synology_memory`](examples/synology_memory.rs) | QuickConnect in mainland China, relay fallback, two-step sign-in | `cargo run --example synology_memory --features testing` |
 | [`ureq_executor`](examples/ureq_executor.rs) | A blocking executor with `ureq` | `cargo run --example ureq_executor -- <folder>` |
 | [`reqwest_executor`](examples/reqwest_executor.rs) | An async executor with `reqwest` and `tokio` | `cargo run --example reqwest_executor -- <folder>` |
 
@@ -110,8 +115,8 @@ OAuth providers offer two scopes (`AccessScope`), and you choose:
   app-authorized files, including files moved outside it.
 - `Full`: the whole drive; paths are relative to its root.
 
-`ProviderKind::access_scopes()` lists the scopes in order of preference; default to the first. WebDAV and Nextcloud only
-offer `Full`. [Provider notes](docs/PROVIDERS.md#access-scopes) explain how each provider requests them.
+`ProviderKind::access_scopes()` lists the scopes in order of preference; default to the first. WebDAV, Nextcloud and
+Synology only offer `Full`. [Provider notes](docs/PROVIDERS.md#access-scopes) explain how each provider requests them.
 
 ## Scope and limits
 
@@ -129,8 +134,9 @@ backups. It deliberately leaves out:
 
 ## Testing and verification
 
-- Every operation runs against in-memory servers for all five providers, once per access scope, including concurrent
-  writers, weak ETags, paging, redirects, token refresh and revocation (`tests/`).
+- Every operation runs against in-memory servers for every provider, once per access scope, including concurrent
+  writers, weak ETags, paging, redirects, token refresh and revocation (`tests/`). The Synology server also plays the
+  QuickConnect control hosts of both regions, regional redirects, relay tunnels and expiring sessions.
 - `golden/` holds responses in the shapes Nextcloud, Apache mod_dav and NAS devices send, and from the Dropbox,
   Microsoft Graph and Google Drive APIs, taken from their documentation and live testing, including fields cloudset
   ignores.
