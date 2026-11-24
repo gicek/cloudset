@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let endpoint = Endpoint::parse(&env("CLOUDSET_URL")?, Transport::RequireHttps)?;
-    let config = ClientConfig::new("cloudset-example/0.3");
+    let config = ClientConfig::new("cloudset-example/0.4");
     let executor = Executor::new(config.limits.max_body_bytes)?;
     let client = Client::new(Connection::webdav(endpoint, env("CLOUDSET_USER")?, env("CLOUDSET_PASSWORD")?), config);
 

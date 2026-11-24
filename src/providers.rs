@@ -21,7 +21,7 @@ pub(crate) fn is_api_url(provider: ProviderKind, url: &str) -> bool {
         ProviderKind::OneDrive => host == "graph.microsoft.com",
         // Metadata and uploads share this host (`/drive/v3`, `/upload/drive/v3`).
         ProviderKind::GoogleDrive => host == "www.googleapis.com",
-        ProviderKind::WebDav | ProviderKind::Nextcloud => false,
+        ProviderKind::WebDav | ProviderKind::Nextcloud | ProviderKind::Synology => false,
     }
 }
 
@@ -51,7 +51,7 @@ pub(crate) fn account_request(credential: &OAuthCredential, config: &ClientConfi
         ProviderKind::GoogleDrive => {
             json_request(Method::Get, "https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress)", None)
         }
-        ProviderKind::WebDav | ProviderKind::Nextcloud => return Err(CloudError::InvalidConnection),
+        ProviderKind::WebDav | ProviderKind::Nextcloud | ProviderKind::Synology => return Err(CloudError::InvalidConnection),
     };
     request.headers.push(("Authorization".into(), format!("Bearer {}", credential.access_token.as_str())));
     request.headers.push(("User-Agent".into(), config.user_agent.clone()));
@@ -75,7 +75,7 @@ pub(crate) fn parse_account(provider: ProviderKind, response: &HttpResponse) -> 
         ProviderKind::GoogleDrive => ["emailAddress", "displayName"]
             .iter()
             .find_map(|key| json.pointer(&format!("/user/{key}")).and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()))?,
-        ProviderKind::WebDav | ProviderKind::Nextcloud => return None,
+        ProviderKind::WebDav | ProviderKind::Nextcloud | ProviderKind::Synology => return None,
     };
     Some(name.to_owned())
 }

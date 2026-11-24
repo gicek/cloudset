@@ -50,6 +50,7 @@ A `Connection` describes one signed-in storage location.
 | --- | --- |
 | WebDAV | `Connection::webdav(Endpoint::parse(url, transport)?, user_name, password)` |
 | Nextcloud | `nextcloud::begin_login` + `nextcloud::poll_login`, or `Connection::webdav` with an app password |
+| Synology | `synology::sign_in`, with an address found through `synology::quickconnect` or typed by the user |
 | Dropbox, OneDrive, Google Drive | `oauth::begin` + `Authorization::complete` |
 
 ### Server addresses
@@ -169,6 +170,54 @@ let connection = loop {
 `config.user_agent` is the device name the user sees under "Devices & sessions" in Nextcloud. `client.revoke()` deletes
 the app password when the user disconnects.
 
+## Signing in to Synology
+
+Synology connections need a DSM address, a root folder (a shared folder, optionally with a path inside it) and the DSM
+user name and password. With a QuickConnect ID, find the address first:
+
+```rust
+use cloudset::synology::{self, SignIn, quickconnect::{self, QuickConnectId, Region}};
+
+let id = QuickConnectId::parse(&typed)?; // "my-nas", "quickconnect.to/my-nas", "my-nas.quickconnect.cn", …
+let region = Region::from_address(&typed).unwrap_or(region_from_locale); // ChinaMainland for users in mainland China
+let resolution = run(quickconnect::resolve(&id, region, &config))?;
+
+// Probe every candidate at once, with a timeout of 2 to 5 seconds each; take the first answering one in list order.
+let endpoint = match first_answering(resolution.candidates(), |candidate| resolution.probe(&candidate.endpoint, &config)) {
+    Some(candidate) => candidate.endpoint,
+    None => {
+        let relays = run(resolution.request_relay(&config))?;
+        first_answering(&relays, |candidate| resolution.probe(&candidate.endpoint, &config)).ok_or(Unreachable)?.endpoint
+    }
+};
+
+let sign_in = SignIn::new(endpoint, RemotePath::parse("home/MyApp")?, user, password).with_quickconnect(id, resolution.region());
+let connection = match run(synology::sign_in(sign_in.clone(), &config)) {
+    Err(CloudError::OtpRequired) => run(synology::sign_in(sign_in.with_otp_code(ask_for_code()?), &config))?,
+    result => result?,
+};
+```
+
+- A probe counts a transport error (timeout, refused connection, certificate) as no answer. It sends no credentials and
+  only succeeds when the address names this device, which rules out another Synology device at a stale address. It is
+  not authentication (the server ID it checks is public): the password is protected by TLS alone. Bare IP candidates
+  rarely have a certificate the system trusts; skip them rather than pinning a certificate because a probe succeeded.
+- **Mainland China.** Synology runs separate control hosts and relays there (`quickconnect.cn`), and
+  `global.quickconnect.to` is often slow or unreachable from inside China. Start with `Region::ChinaMainland` when the
+  user typed a `quickconnect.cn` address or is in mainland China, and with `Region::Global` otherwise. When the control
+  host cannot be reached at all, resolve again with `region.other()`. Devices registered in the other region are found
+  either way, through a regional redirect.
+- **Moving between networks.** A connection keeps the address it signed in on. When it stops answering (the laptop
+  left the home network), resolve `connection.quickconnect()` again, probe, and switch with
+  `connection.with_endpoint(endpoint)`; persist the result. DSM ties sessions to the client's IP, so the switch drops
+  the session and the next operation signs in again; the same happens on its own when only the client's IP changes.
+- **Sessions** expire after DSM's idle timeout. Operations sign in again with the stored password and the device token
+  from the two-step sign-in, so no new code is needed; persist the renewed connection from `take_connection()`. A
+  changed password or a removed trusted device reports `ReauthRequired`.
+- `config.user_agent` is the device name DSM lists under trusted devices. `client.revoke()` ends the session and hands
+  back the connection without it; the stored password could sign in again, so delete the stored connection to forget
+  it.
+
 ## File operations
 
 | Method | Result | Notes |
@@ -203,7 +252,8 @@ A missing revision permits a read but cannot authorize a conditional replacement
 
 #### Without conditional writes
 
-Google Drive, a WebDAV server with weak ETags and OneDrive uploads that need a session cannot enforce `Matches`.
+Google Drive, Synology, a WebDAV server with weak ETags and OneDrive uploads that need a session cannot enforce
+`Matches`. Synology entries carry no revision; compare size and modification time instead.
 `Precondition::None` still works there, with a window in which another device's write can be overwritten. Narrow it
 like this:
 
@@ -257,6 +307,7 @@ error type. A typical mapping for a user interface:
 | Error | What to tell the user or do |
 | --- | --- |
 | `ReauthRequired` | Sign in again |
+| `OtpRequired` | Ask for the one-time code from the authenticator app and sign in again with it |
 | `Forbidden`, `NotFound` | Check the folder and permissions |
 | `PreconditionFailed` | Re-read and retry; another device wrote first |
 | `UnsupportedPrecondition` | This provider cannot safely perform the requested automatic write |
@@ -269,6 +320,7 @@ error type. A typical mapping for a user interface:
 | `StateMismatch`, `AuthorizationDenied` | Start the sign-in again |
 | `InvalidConnection` | The stored connection is unreadable; sign in again |
 | `Server`, `InvalidResponse`, `InsecureRedirect`, `TooManyRedirects` | The server misbehaved; try again later |
+| `Provider { code }` | The provider's API refused with an error of its own (Synology); show the code, try again later |
 | `OutOfOrder` | A bug in your drive loop |
 
 `CloudError` is `#[non_exhaustive]`: keep a fallback arm when you match it.
@@ -319,4 +371,8 @@ assert_eq!(server.data("a.txt").as_deref(), Some(&b"x"[..]));
 - `testing::oauth::MemoryCloud::new(FakeProvider::Dropbox | OneDrive | GoogleDrive)` serves sign-in, token refresh and
   file APIs. `authorize(url)` plays the user on the authorization page and returns the callback URL;
   `expire_access_token()` forces a refresh; `races()` simulates concurrent writers and moves on Google Drive.
+- `testing::synology::MemorySynology::new(Region::Global | ChinaMainland)` is a device with its QuickConnect
+  registration: control hosts of both regions with regional redirects, relay tunnels (`relay_address`), addresses that
+  answer (`reachable`), another device on an address (`other_device`), two-step verification (`otp_code`) and expiring
+  sessions (`expire_sessions`).
 - Pass a fixed time with `ClientConfig::with_now` to make token expiry deterministic.

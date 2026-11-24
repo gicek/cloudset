@@ -15,6 +15,10 @@ use crate::http::{HttpRequest, HttpResponse, Method};
 #[path = "testing_oauth.rs"]
 pub mod oauth;
 
+/// In-memory Synology device with its QuickConnect control hosts, relay and File Station API.
+#[path = "testing_synology.rs"]
+pub mod synology;
+
 /// WebDAV root URL of the server; use it for the connection's `Endpoint`.
 pub const BASE: &str = "https://dav.example.com/dav/";
 const SEGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'#').add(b'?').add(b'%').add(b'&').add(b'<').add(b'>').add(b'"');

@@ -21,7 +21,7 @@ fn env(name: &str) -> String {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = Endpoint::parse(&env("CLOUDSET_URL"), Transport::RequireHttps)?;
     let connection = Connection::webdav(endpoint, env("CLOUDSET_USER"), env("CLOUDSET_PASSWORD"));
-    let config = ClientConfig::new("cloudset-example/0.3");
+    let config = ClientConfig::new("cloudset-example/0.4");
     let executor = Executor::new(&config.limits);
     let client = Client::new(connection, config);
 

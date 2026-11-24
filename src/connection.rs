@@ -12,6 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::error::CloudError;
 use crate::http::Origin;
 use crate::path::RemotePath;
+use crate::synology::quickconnect::{QuickConnectId, Region};
 
 /// A storage provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -27,18 +28,20 @@ pub enum ProviderKind {
     OneDrive,
     /// Google Drive (Drive API v3).
     GoogleDrive,
+    /// Synology DSM 7 through the File Station API, reached directly or through QuickConnect (see [`crate::synology`]).
+    Synology,
 }
 
 impl ProviderKind {
     /// Supported access scopes, in order of preference. Providers with an app-specific folder list `AppFolder` first:
     /// callers use it by default and treat it directly as the working directory, so users need not browse remote
-    /// directories. WebDAV / Nextcloud have no app folder and their credentials reach the whole account, so they only
-    /// offer `Full`.
+    /// directories. WebDAV, Nextcloud and Synology have no app folder and their credentials reach the whole account, so
+    /// they only offer `Full`.
     #[must_use]
     pub fn access_scopes(self) -> &'static [AccessScope] {
         match self {
             Self::Dropbox | Self::OneDrive | Self::GoogleDrive => &[AccessScope::AppFolder, AccessScope::Full],
-            Self::WebDav | Self::Nextcloud => &[AccessScope::Full],
+            Self::WebDav | Self::Nextcloud | Self::Synology => &[AccessScope::Full],
         }
     }
 }
@@ -277,6 +280,25 @@ pub(crate) struct OAuthCredential {
     pub folder_name: Option<String>,
 }
 
+/// Credentials of a Synology connection. The password stays because DSM sessions expire and have to be renewed without
+/// the user; the device token lets that renewal skip two-step verification.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SynologyCredential {
+    /// The DSM address (`https://nas.example.com:5001/`, or a QuickConnect route).
+    pub endpoint: Endpoint,
+    /// The folder that serves as the connection root: a shared folder, optionally followed by a path inside it.
+    pub root: RemotePath,
+    pub username: String,
+    pub password: Zeroizing<String>,
+    /// Trusted-device token (`did`) issued at a sign-in with a one-time code.
+    pub device_token: Option<Zeroizing<String>>,
+    /// The current session ID (`sid`); `None` until the first sign-in or after it was revoked.
+    pub session: Option<Zeroizing<String>>,
+    /// The QuickConnect ID this address was resolved from, and the region of its control host.
+    pub quickconnect: Option<(QuickConnectId, Region)>,
+    pub certificate: Option<PinnedCertificate>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum Kind {
     WebDav {
@@ -294,6 +316,7 @@ enum Kind {
         certificate: Option<PinnedCertificate>,
     },
     OAuth(OAuthCredential),
+    Synology(SynologyCredential),
 }
 
 /// Everything needed to access one storage. `Debug` does not print passwords or tokens.
@@ -336,15 +359,63 @@ struct Stored {
     /// Google Drive app folder name; present exactly when the provider is Google Drive with the app folder scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     app_folder: Option<String>,
-    /// Lowercase hex SHA-256 of the pinned certificate; only present on `https://` WebDAV / Nextcloud.
+    /// Lowercase hex SHA-256 of the pinned certificate; only present on `https://` WebDAV / Nextcloud / Synology.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pinned_certificate: Option<String>,
+    /// Synology: the root folder (`shared folder/path`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
+    /// Synology: the trusted-device token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_token: Option<String>,
+    /// Synology: the current session ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    /// Synology: the QuickConnect ID the address came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quickconnect_id: Option<String>,
+    /// Synology: the QuickConnect region; present exactly when `quickconnect_id` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+}
+
+impl Stored {
+    fn has_oauth_fields(&self) -> bool {
+        self.access.is_some()
+            || self.client_id.is_some()
+            || self.client_secret.is_some()
+            || self.access_token.is_some()
+            || self.refresh_token.is_some()
+            || self.expires_at.is_some()
+            || self.account.is_some()
+            || self.app_folder.is_some()
+    }
+
+    fn has_synology_fields(&self) -> bool {
+        self.root.is_some()
+            || self.device_token.is_some()
+            || self.session.is_some()
+            || self.quickconnect_id.is_some()
+            || self.region.is_some()
+    }
+
+    fn pinned_certificate(&self) -> Result<Option<PinnedCertificate>, CloudError> {
+        self.pinned_certificate.as_deref().map(|hex| PinnedCertificate::from_hex(hex).ok_or(CloudError::InvalidConnection)).transpose()
+    }
 }
 
 impl Drop for Stored {
     /// Wipes the passwords and tokens in intermediate copies.
     fn drop(&mut self) {
-        for secret in [&mut self.password, &mut self.client_secret, &mut self.access_token, &mut self.refresh_token].into_iter().flatten() {
+        let secrets = [
+            &mut self.password,
+            &mut self.client_secret,
+            &mut self.access_token,
+            &mut self.refresh_token,
+            &mut self.device_token,
+            &mut self.session,
+        ];
+        for secret in secrets.into_iter().flatten() {
             secret.zeroize();
         }
     }
@@ -357,6 +428,7 @@ fn provider_name(provider: ProviderKind) -> &'static str {
         ProviderKind::Dropbox => "dropbox",
         ProviderKind::OneDrive => "onedrive",
         ProviderKind::GoogleDrive => "googledrive",
+        ProviderKind::Synology => "synology",
     }
 }
 
@@ -372,8 +444,8 @@ impl Connection {
         Self { kind: Kind::Nextcloud { server, endpoint, username, password: Zeroizing::new(password), certificate: None } }
     }
 
-    /// Pins a server certificate the user confirmed. Only WebDAV and Nextcloud connections whose addresses are all
-    /// `https://` can do this.
+    /// Pins a server certificate the user confirmed. Only WebDAV, Nextcloud and Synology connections whose addresses are
+    /// all `https://` can do this.
     ///
     /// # Errors
     ///
@@ -386,18 +458,20 @@ impl Connection {
             Kind::Nextcloud { server, endpoint, certificate, .. } if server.is_secure() && endpoint.is_secure() => {
                 *certificate = Some(pinned);
             }
+            Kind::Synology(credential) if credential.endpoint.is_secure() => credential.certificate = Some(pinned),
             _ => return Err(refused),
         }
         Ok(self)
     }
 
-    /// The pinned certificate and its origin (the origin of the WebDAV address; for Nextcloud, the server's origin, which
-    /// the WebDAV address shares).
+    /// The pinned certificate and its origin (the origin of the WebDAV or DSM address; for Nextcloud, the server's origin,
+    /// which the WebDAV address shares).
     #[must_use]
     pub fn certificate_pin(&self) -> Option<CertificatePin> {
         let (origin_of, certificate) = match &self.kind {
             Kind::WebDav { endpoint, certificate, .. } => (endpoint, certificate),
             Kind::Nextcloud { server, certificate, .. } => (server, certificate),
+            Kind::Synology(credential) => (&credential.endpoint, &credential.certificate),
             Kind::OAuth(_) => return None,
         };
         certificate.and_then(|certificate| CertificatePin::new(origin_of, certificate).ok())
@@ -407,6 +481,50 @@ impl Connection {
         Self { kind: Kind::OAuth(credential) }
     }
 
+    pub(crate) fn synology(credential: SynologyCredential) -> Self {
+        Self { kind: Kind::Synology(credential) }
+    }
+
+    pub(crate) fn synology_credential(&self) -> Option<&SynologyCredential> {
+        match &self.kind {
+            Kind::Synology(credential) => Some(credential),
+            _ => None,
+        }
+    }
+
+    /// Moves a Synology connection to another address of the same device, such as a QuickConnect route that
+    /// [`Resolution::probe`](crate::synology::quickconnect::Resolution::probe) found. The password goes to the new
+    /// address from then on, protected by its certificate. When the origin changes, the pinned certificate (which belongs
+    /// to the old origin) and the session (DSM ties it to the client's IP) are dropped; the next operation signs in again.
+    /// The old session is not signed out: DSM ends it after its idle timeout.
+    ///
+    /// # Errors
+    ///
+    /// [`CloudError::InvalidConnection`] for any other provider, whose address is fixed, and
+    /// [`CloudError::InsecureEndpoint`] for a move from `https://` to plain HTTP.
+    pub fn with_endpoint(mut self, endpoint: Endpoint) -> Result<Self, CloudError> {
+        let Kind::Synology(credential) = &mut self.kind else { return Err(CloudError::InvalidConnection) };
+        if credential.endpoint.is_secure() && !endpoint.is_secure() {
+            return Err(CloudError::InsecureEndpoint);
+        }
+        if credential.endpoint.origin() != endpoint.origin() {
+            credential.certificate = None;
+            credential.session = None;
+        }
+        credential.endpoint = endpoint;
+        Ok(self)
+    }
+
+    /// The QuickConnect ID a Synology connection was resolved from and the region of its control host; resolve it again
+    /// when the stored address stops answering (the device moved, or the client left the local network).
+    #[must_use]
+    pub fn quickconnect(&self) -> Option<(&QuickConnectId, Region)> {
+        match &self.kind {
+            Kind::Synology(SynologyCredential { quickconnect: Some((id, region)), .. }) => Some((id, *region)),
+            _ => None,
+        }
+    }
+
     /// The provider.
     #[must_use]
     pub fn provider(&self) -> ProviderKind {
@@ -414,16 +532,25 @@ impl Connection {
             Kind::WebDav { .. } => ProviderKind::WebDav,
             Kind::Nextcloud { .. } => ProviderKind::Nextcloud,
             Kind::OAuth(credential) => credential.provider,
+            Kind::Synology(_) => ProviderKind::Synology,
         }
     }
 
-    /// WebDAV root address (`…/remote.php/dav/files/<user>/` on Nextcloud); `None` for OAuth providers.
+    /// WebDAV root address (`…/remote.php/dav/files/<user>/` on Nextcloud), or the DSM address on Synology; `None` for
+    /// OAuth providers.
     #[must_use]
     pub fn endpoint(&self) -> Option<&Endpoint> {
         match &self.kind {
             Kind::WebDav { endpoint, .. } | Kind::Nextcloud { endpoint, .. } => Some(endpoint),
+            Kind::Synology(credential) => Some(&credential.endpoint),
             Kind::OAuth(_) => None,
         }
+    }
+
+    /// The Synology root folder (`shared folder/path`) that paths are relative to; `None` for everything else.
+    #[must_use]
+    pub fn root_folder(&self) -> Option<&RemotePath> {
+        self.synology_credential().map(|credential| &credential.root)
     }
 
     /// Nextcloud server root address; `None` for everything else.
@@ -435,12 +562,13 @@ impl Connection {
         }
     }
 
-    /// The account to show the user: the WebDAV user name, the Nextcloud login name, or the email address (or, when the
-    /// provider has none, the display name) of an OAuth account.
+    /// The account to show the user: the WebDAV or DSM user name, the Nextcloud login name, or the email address (or,
+    /// when the provider has none, the display name) of an OAuth account.
     #[must_use]
     pub fn account(&self) -> &str {
         match &self.kind {
             Kind::WebDav { username, .. } | Kind::Nextcloud { username, .. } => username,
+            Kind::Synology(credential) => &credential.username,
             Kind::OAuth(credential) => &credential.account,
         }
     }
@@ -451,21 +579,23 @@ impl Connection {
         match &self.kind {
             Kind::WebDav { endpoint, .. } => endpoint.host(),
             Kind::Nextcloud { server, .. } => server.host(),
+            Kind::Synology(credential) => credential.endpoint.host(),
             Kind::OAuth(credential) => match credential.provider {
                 ProviderKind::Dropbox => "dropbox.com",
                 ProviderKind::OneDrive => "onedrive.live.com",
                 ProviderKind::GoogleDrive => "drive.google.com",
-                ProviderKind::WebDav | ProviderKind::Nextcloud => "",
+                ProviderKind::WebDav | ProviderKind::Nextcloud | ProviderKind::Synology => "",
             },
         }
     }
 
-    /// Whether the transport is encrypted: false only for plain-HTTP WebDAV / Nextcloud the user confirmed.
+    /// Whether the transport is encrypted: false only for plain-HTTP WebDAV / Nextcloud / Synology the user confirmed.
     #[must_use]
     pub fn is_secure(&self) -> bool {
         match &self.kind {
             Kind::WebDav { endpoint, .. } => endpoint.is_secure(),
             Kind::Nextcloud { server, .. } => server.is_secure(),
+            Kind::Synology(credential) => credential.endpoint.is_secure(),
             Kind::OAuth(_) => true,
         }
     }
@@ -489,7 +619,7 @@ impl Connection {
     pub(crate) fn basic_authorization(&self) -> Zeroizing<String> {
         let (username, password) = match &self.kind {
             Kind::WebDav { username, password, .. } | Kind::Nextcloud { username, password, .. } => (username.as_str(), password.as_str()),
-            Kind::OAuth(_) => ("", ""),
+            Kind::OAuth(_) | Kind::Synology(_) => ("", ""),
         };
         let credentials = Zeroizing::new(format!("{username}:{password}"));
         Zeroizing::new(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())))
@@ -529,6 +659,19 @@ impl Connection {
                 stored.account = Some(credential.account.clone());
                 stored.app_folder = credential.folder_name.clone();
             }
+            Kind::Synology(credential) => {
+                stored.endpoint = Some(credential.endpoint.as_str().to_owned());
+                stored.root = Some(credential.root.to_string());
+                stored.username = Some(credential.username.clone());
+                stored.password = Some(credential.password.to_string());
+                stored.device_token = credential.device_token.as_ref().map(|token| token.to_string());
+                stored.session = credential.session.as_ref().map(|session| session.to_string());
+                if let Some((id, region)) = &credential.quickconnect {
+                    stored.quickconnect_id = Some(id.as_str().to_owned());
+                    stored.region = Some(region.as_str().to_owned());
+                }
+                stored.pinned_certificate = credential.certificate.map(PinnedCertificate::to_hex);
+            }
         }
         Zeroizing::new(serde_json::to_vec(&stored).unwrap_or_default())
     }
@@ -547,23 +690,15 @@ impl Connection {
         }
         let parse = |text: &str| Endpoint::parse(text, Transport::AllowInsecureHttp).map_err(|_| CloudError::InvalidConnection);
         let invalid = || CloudError::InvalidConnection;
-        let has_oauth_fields = stored.access.is_some()
-            || stored.client_id.is_some()
-            || stored.client_secret.is_some()
-            || stored.access_token.is_some()
-            || stored.refresh_token.is_some();
         let kind = match stored.provider.as_str() {
             "webdav" | "nextcloud" => {
-                if has_oauth_fields || stored.account.is_some() || stored.expires_at.is_some() || stored.app_folder.is_some() {
+                if stored.has_oauth_fields() || stored.has_synology_fields() {
                     return Err(invalid());
                 }
                 let endpoint = parse(stored.endpoint.as_deref().ok_or_else(invalid)?)?;
                 let username = stored.username.take().ok_or_else(invalid)?;
                 let password = Zeroizing::new(stored.password.take().ok_or_else(invalid)?);
-                let certificate = match stored.pinned_certificate.as_deref() {
-                    Some(hex) => Some(PinnedCertificate::from_hex(hex).ok_or_else(invalid)?),
-                    None => None,
-                };
+                let certificate = stored.pinned_certificate()?;
                 let kind = match (stored.provider.as_str(), stored.server.as_deref()) {
                     ("webdav", None) => Kind::WebDav { endpoint, username, password, certificate: None },
                     ("nextcloud", Some(server)) => {
@@ -578,8 +713,43 @@ impl Connection {
                     None => Ok(connection),
                 };
             }
+            "synology" => {
+                if stored.has_oauth_fields() || stored.server.is_some() {
+                    return Err(invalid());
+                }
+                let quickconnect = match (stored.quickconnect_id.as_deref(), stored.region.as_deref()) {
+                    (Some(id), Some(region)) => {
+                        Some((QuickConnectId::parse(id).map_err(|_| invalid())?, Region::from_name(region).ok_or_else(invalid)?))
+                    }
+                    (None, None) => None,
+                    _ => return Err(invalid()),
+                };
+                let certificate = stored.pinned_certificate()?;
+                let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty()).map(Zeroizing::new);
+                let credential = SynologyCredential {
+                    endpoint: parse(stored.endpoint.as_deref().ok_or_else(invalid)?)?,
+                    root: stored
+                        .root
+                        .as_deref()
+                        .and_then(|root| RemotePath::parse(root).ok())
+                        .filter(|root| !root.is_root())
+                        .ok_or_else(invalid)?,
+                    username: stored.username.take().filter(|name| !name.is_empty()).ok_or_else(invalid)?,
+                    password: Zeroizing::new(stored.password.take().ok_or_else(invalid)?),
+                    device_token: non_empty(stored.device_token.take()),
+                    session: non_empty(stored.session.take()),
+                    quickconnect,
+                    certificate: None,
+                };
+                let connection = Self::synology(credential);
+                return match certificate {
+                    Some(certificate) => connection.with_pinned_certificate(certificate).map_err(|_| invalid()),
+                    None => Ok(connection),
+                };
+            }
             "dropbox" | "onedrive" | "googledrive" => {
-                if stored.endpoint.is_some()
+                if stored.has_synology_fields()
+                    || stored.endpoint.is_some()
                     || stored.server.is_some()
                     || stored.username.is_some()
                     || stored.password.is_some()
@@ -667,8 +837,56 @@ mod tests {
         for provider in [ProviderKind::Dropbox, ProviderKind::OneDrive, ProviderKind::GoogleDrive] {
             assert_eq!(provider.access_scopes(), [AccessScope::AppFolder, AccessScope::Full]);
         }
-        for provider in [ProviderKind::WebDav, ProviderKind::Nextcloud] {
+        for provider in [ProviderKind::WebDav, ProviderKind::Nextcloud, ProviderKind::Synology] {
             assert_eq!(provider.access_scopes(), [AccessScope::Full]);
+        }
+    }
+
+    fn synology() -> Connection {
+        Connection::synology(SynologyCredential {
+            endpoint: Endpoint::parse("https://my-nas.cn4.quickconnect.cn/", Transport::RequireHttps).unwrap(),
+            root: RemotePath::parse("home/Notes").unwrap(),
+            username: "alice".into(),
+            password: Zeroizing::new("dsm-password".into()),
+            device_token: Some(Zeroizing::new("device-token".into())),
+            session: Some(Zeroizing::new("session-id".into())),
+            quickconnect: Some((QuickConnectId::parse("my-nas").unwrap(), Region::ChinaMainland)),
+            certificate: None,
+        })
+    }
+
+    #[test]
+    fn synology_connections_round_trip_and_validate() {
+        let connection = synology();
+        let restored = Connection::from_bytes(&connection.to_bytes()).unwrap();
+        assert_eq!(restored, connection);
+        assert_eq!(
+            (restored.provider(), restored.host(), restored.account()),
+            (ProviderKind::Synology, "my-nas.cn4.quickconnect.cn", "alice")
+        );
+        assert_eq!(restored.root_folder().map(ToString::to_string).as_deref(), Some("home/Notes"));
+        assert_eq!(restored.quickconnect().map(|(id, region)| (id.as_str(), region)), Some(("my-nas", Region::ChinaMainland)));
+        assert_eq!(restored.access_scope(), None);
+        let debug = format!("{connection:?}");
+        assert!(!["dsm-password", "device-token", "session-id"].iter().any(|secret| debug.contains(secret)), "{debug}");
+
+        let base = r#""version":1,"provider":"synology","endpoint":"https://nas.local:5001/","username":"a","password":"b""#;
+        assert!(Connection::from_bytes(format!(r#"{{{base},"root":"home"}}"#).as_bytes()).unwrap().quickconnect().is_none());
+        for bad in [
+            format!("{{{base}}}"),
+            format!(r#"{{{base},"root":""}}"#),
+            format!(r#"{{{base},"root":"a/../b"}}"#),
+            format!(r#"{{{base},"root":"home","quickconnectId":"my-nas"}}"#),
+            format!(r#"{{{base},"root":"home","quickconnectId":"my-nas","region":"mars"}}"#),
+            format!(r#"{{{base},"root":"home","quickconnectId":"-bad","region":"global"}}"#),
+            format!(r#"{{{base},"root":"home","region":"global"}}"#),
+            format!(r#"{{{base},"root":"home","accessToken":"t"}}"#),
+            format!(r#"{{{base},"root":"home","server":"https://x/"}}"#),
+            r#"{"version":1,"provider":"synology","endpoint":"http://nas.local:5000/","username":"a","password":"b","root":"home","pinnedCertificate":"abababababababababababababababababababababababababababababababab"}"#.to_owned(),
+            r#"{"version":1,"provider":"webdav","endpoint":"https://x/","username":"a","password":"b","root":"home"}"#.to_owned(),
+            r#"{"version":1,"provider":"dropbox","access":"full","clientId":"k","accessToken":"a","refreshToken":"r","session":"s"}"#.to_owned(),
+        ] {
+            assert_eq!(Connection::from_bytes(bad.as_bytes()), Err(CloudError::InvalidConnection), "{bad}");
         }
     }
 

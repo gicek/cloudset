@@ -1,4 +1,4 @@
-//! A sans-IO cloud storage client for WebDAV, Nextcloud, Dropbox, OneDrive and Google Drive.
+//! A sans-IO cloud storage client for WebDAV, Nextcloud, Synology (with QuickConnect), Dropbox, OneDrive and Google Drive.
 //!
 //! The crate builds HTTP requests, parses responses and advances state machines. It never opens a socket, reads a file,
 //! the clock or the environment, or produces random numbers: you send the requests with any HTTP stack, keep the
@@ -8,8 +8,9 @@
 //! # Overview
 //!
 //! - A [`Connection`] says where and how to sign in: [`Connection::webdav`] for WebDAV and Nextcloud app passwords,
-//!   [`nextcloud::begin_login`] for Nextcloud Login Flow v2, and [`oauth::begin`] for Dropbox, OneDrive and Google Drive.
-//!   Persist it with [`Connection::to_bytes`] and [`Connection::from_bytes`].
+//!   [`nextcloud::begin_login`] for Nextcloud Login Flow v2, [`synology::sign_in`] for Synology DSM (found by address or
+//!   through [`synology::quickconnect`]), and [`oauth::begin`] for Dropbox, OneDrive and Google Drive. Persist it with
+//!   [`Connection::to_bytes`] and [`Connection::from_bytes`].
 //! - A [`Client`] turns each file operation ([`stat`](Client::stat), [`list`](Client::list), [`read`](Client::read),
 //!   [`write`](Client::write), [`create_dir`](Client::create_dir), [`rename`](Client::rename),
 //!   [`delete`](Client::delete), [`revoke`](Client::revoke)) into an [`Operation`].
@@ -66,6 +67,7 @@ mod onedrive;
 mod operation;
 mod path;
 mod providers;
+pub mod synology;
 #[cfg(feature = "testing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod testing;
