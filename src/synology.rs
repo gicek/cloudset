@@ -10,6 +10,7 @@
 //!    connection back like a refreshed OAuth token: persist [`Operation::take_connection`](crate::Operation) updates.
 //!
 //! Paths are relative to the root folder: a shared folder (`home`, `Backups`), optionally followed by a path inside it.
+//! Without a root folder they are relative to the device, whose top level lists the shared folders (see [`sign_in`]).
 //! The DSM user needs the File Station application permission and access to that shared folder.
 //!
 //! ```no_run
@@ -50,7 +51,7 @@ use crate::client::ClientConfig;
 use crate::connection::{Connection, Endpoint, SynologyCredential};
 use crate::error::CloudError;
 use crate::http::HttpResponse;
-use crate::operation::{BoxOperation, Done, Operation, Ready, Step};
+use crate::operation::{BoxOperation, Done, Operation, Step};
 use crate::path::RemotePath;
 
 mod api;
@@ -113,22 +114,24 @@ impl fmt::Debug for SignIn {
 
 /// Signs in, checks that the root folder exists, and yields the connection.
 ///
+/// With [`RemotePath::root`] as the root folder, the connection reaches the whole device: listing its root lists the
+/// shared folders the user can see, and nothing can be created, changed or deleted at that top level. This is the way
+/// to let the user pick a folder: sign in without one, browse with [`Client::list`](crate::Client::list) and
+/// [`Client::create_dir`](crate::Client::create_dir), then move the connection to the chosen folder with
+/// [`Connection::with_root_folder`]. The session and the trusted device carry over, so no second one-time code is
+/// needed.
+///
 /// # Errors
 ///
 /// The operation reports [`CloudError::ReauthRequired`] for a wrong user name or password, [`CloudError::OtpRequired`]
 /// when a one-time code is needed or the one given was wrong, [`CloudError::Forbidden`] for a disabled account, a
-/// blocked address or an expired password, [`CloudError::NotFound`] when the root folder does not exist, and
-/// [`CloudError::InvalidPath`] for an empty root.
+/// blocked address, an expired password or an account without File Station, and [`CloudError::NotFound`] when the
+/// root folder does not exist.
 ///
 /// The root folder can only be checked once signed in. When that check fails after a sign-in with a one-time code, DSM
-/// has already trusted the device; the next attempt needs a new code and adds another trusted-device entry. With an
-/// account that uses two-step verification, sign in with a folder that is sure to exist (`home`, when DSM user homes
-/// are on), then let the user pick the folder to use from [`Client::list`](crate::Client::list) and sign in with it
-/// as the root once the device is trusted.
+/// has already trusted the device; the next attempt needs a new code and adds another trusted-device entry. Signing in
+/// without a root folder avoids that.
 pub fn sign_in(request: SignIn, config: &ClientConfig) -> BoxOperation<Connection> {
-    if request.root.is_root() {
-        return Box::new(Ready::err(CloudError::InvalidPath));
-    }
     let credential = SynologyCredential {
         endpoint: request.endpoint,
         root: request.root,

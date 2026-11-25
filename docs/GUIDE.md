@@ -172,8 +172,9 @@ the app password when the user disconnects.
 
 ## Signing in to Synology
 
-Synology connections need a DSM address, a root folder (a shared folder, optionally with a path inside it) and the DSM
-user name and password. With a QuickConnect ID, find the address first:
+Synology connections need a DSM address, the DSM user name and password, and a root folder (a shared folder,
+optionally with a path inside it) or `RemotePath::root()` for the whole device. With a QuickConnect ID, find the address
+first:
 
 ```rust
 use cloudset::synology::{self, SignIn, quickconnect::{self, QuickConnectId, Region}};
@@ -211,6 +212,10 @@ let connection = match run(synology::sign_in(sign_in.clone(), &config)) {
   left the home network), resolve `connection.quickconnect()` again, probe, and switch with
   `connection.with_endpoint(endpoint)`; persist the result. DSM ties sessions to the client's IP, so the switch drops
   the session and the next operation signs in again; the same happens on its own when only the client's IP changes.
+- **Letting the user pick the folder.** Sign in with `RemotePath::root()`: listing the root returns the shared folders,
+  and `list` and `create_dir` work inside them. Then move the connection to the chosen folder with
+  `connection.with_root_folder(path)` and store that. The session and the trusted device carry over, so an account with
+  two-step verification needs its code once. Signing in with a folder that turns out to be missing would need a new code.
 - **Sessions** expire after DSM's idle timeout. Operations sign in again with the stored password and the device token
   from the two-step sign-in, so no new code is needed; persist the renewed connection from `take_connection()`. A
   changed password or a removed trusted device reports `ReauthRequired`.

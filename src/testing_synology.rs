@@ -354,6 +354,7 @@ impl MemorySynology {
         match (api.as_str(), method.as_str()) {
             ("SYNO.FileStation.List", "getinfo") => self.getinfo(&params),
             ("SYNO.FileStation.List", "list") => self.list(&params),
+            ("SYNO.FileStation.List", "list_share") => self.list_share(&params),
             ("SYNO.FileStation.Download", "download") => self.download(&params),
             ("SYNO.FileStation.Upload", "upload") => self.upload(&params),
             ("SYNO.FileStation.CreateFolder", "create") => self.create_folder(&params),
@@ -433,6 +434,20 @@ impl MemorySynology {
         reply(json!({ "total": children.len(), "offset": offset, "files": page }))
     }
 
+    /// The shared folders: every folder at the top level.
+    fn list_share(&self, params: &Params) -> HttpResponse {
+        let shares: Vec<Value> = self
+            .nodes
+            .iter()
+            .filter(|(key, node)| key.len() == 1 && matches!(node, Node::Dir))
+            .map(|(key, _)| json!({ "path": format!("/{}", key[0]), "name": key[0], "isdir": true }))
+            .collect();
+        let offset: usize = params.get("offset").parse().unwrap_or(0);
+        let limit: usize = params.get("limit").parse().unwrap_or(usize::MAX);
+        let page: Vec<Value> = shares.iter().skip(offset).take(limit).cloned().collect();
+        reply(json!({ "total": shares.len(), "offset": offset, "shares": page }))
+    }
+
     fn download(&mut self, params: &Params) -> HttpResponse {
         let path = params.list("path").pop().unwrap_or_default();
         if std::mem::take(&mut self.expire_before_download) {
@@ -479,6 +494,10 @@ impl MemorySynology {
         let parent = params.list("folder_path").pop().unwrap_or_default();
         let name = params.list("name").pop().unwrap_or_default();
         let mut key = split(&parent);
+        // Shared folders are made in the Control Panel, not through File Station.
+        if key.is_empty() {
+            return path_failure(1100, 407, &parent);
+        }
         if !matches!(self.nodes.get(&key), Some(Node::Dir)) {
             return path_failure(1100, 408, &parent);
         }

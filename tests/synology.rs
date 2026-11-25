@@ -313,13 +313,57 @@ fn sign_in_checks_the_password_and_the_root_folder() {
     assert_eq!(drive(&mut server, synology::sign_in(wrong, &config())).err(), Some(CloudError::ReauthRequired));
     let missing = SignIn::new(endpoint(LAN_ADDRESS), path("photo"), "alice", "secret");
     assert_eq!(drive(&mut server, synology::sign_in(missing, &config())).err(), Some(CloudError::NotFound));
-    let root = SignIn::new(endpoint(LAN_ADDRESS), RemotePath::root(), "alice", "secret");
-    assert_eq!(drive(&mut server, synology::sign_in(root, &config())).err(), Some(CloudError::InvalidPath));
     server.mkdir_external("home/Apps/Notes");
     let nested = SignIn::new(endpoint(LAN_ADDRESS), path("home/Apps/Notes"), "alice", "secret");
     let mut client = Client::new(drive(&mut server, synology::sign_in(nested, &config())).unwrap(), config());
     run_op(&mut server, &mut client, |client| client.write(path("n.txt"), b"n".to_vec(), Precondition::Absent)).unwrap();
     assert!(server.data("home/Apps/Notes/n.txt").is_some(), "paths are relative to the root folder");
+}
+
+#[test]
+fn signs_in_to_the_whole_device_then_moves_to_the_folder_picked() {
+    let mut server = MemorySynology::new(Region::Global);
+    server.otp_code = Some("123456".into());
+    server.mkdir_external("Backups");
+    server.mkdir_external("Backups/Old");
+    server.put_external("home/notes.txt", b"n");
+    let request = SignIn::new(endpoint(LAN_ADDRESS), RemotePath::root(), "alice", "secret").with_otp_code("123456");
+    let mut client = Client::new(drive(&mut server, synology::sign_in(request, &config())).unwrap(), config());
+    assert_eq!(client.connection().root_folder(), Some(&RemotePath::root()));
+
+    // The top level lists the shared folders, and is always there.
+    let shares = run_op(&mut server, &mut client, |client| client.list(RemotePath::root())).unwrap();
+    assert_eq!(shares.iter().map(|e| (e.path.to_string(), e.is_dir)).collect::<Vec<_>>(), [("Backups".into(), true), (SHARE.into(), true)]);
+    assert!(run_op(&mut server, &mut client, |client| client.stat(RemotePath::root())).unwrap().is_some_and(|e| e.is_dir));
+    let inside = run_op(&mut server, &mut client, |client| client.list(path("home"))).unwrap();
+    assert_eq!(inside.iter().map(|e| e.path.to_string()).collect::<Vec<_>>(), ["home/notes.txt"]);
+    assert!(run_op(&mut server, &mut client, |client| client.stat(path("Backups/Old"))).unwrap().is_some());
+
+    // Shared folders can't be made, changed or removed here; nothing is sent.
+    let sent = server.requests.len();
+    assert_eq!(run_op(&mut server, &mut client, |client| client.create_dir(path("New"))).err(), Some(CloudError::Forbidden));
+    assert_eq!(run_op(&mut server, &mut client, |client| client.delete(path("Backups"))).err(), Some(CloudError::Forbidden));
+    assert_eq!(run_op(&mut server, &mut client, |client| client.rename(path("Backups"), path("B"))).err(), Some(CloudError::Forbidden));
+    assert_eq!(
+        run_op(&mut server, &mut client, |client| client.write(path("a.txt"), b"x".to_vec(), Precondition::None)).err(),
+        Some(CloudError::Forbidden)
+    );
+    assert_eq!(server.requests.len(), sent);
+
+    // A folder made inside a shared folder becomes the root: same session, no new sign-in or code.
+    run_op(&mut server, &mut client, |client| client.create_dir(path("Backups/MyApp"))).unwrap();
+    let logins =
+        |server: &MemorySynology| server.requests.iter().filter(|r| String::from_utf8_lossy(&r.body).contains("method=login")).count();
+    let before = logins(&server);
+    let moved = client.connection().clone().with_root_folder(path("Backups/MyApp")).unwrap();
+    let mut client = Client::new(Connection::from_bytes(&moved.to_bytes()).unwrap(), config());
+    run_op(&mut server, &mut client, |client| client.write(path("a.txt"), b"x".to_vec(), Precondition::Absent)).unwrap();
+    assert_eq!(server.data("Backups/MyApp/a.txt").as_deref(), Some(&b"x"[..]));
+    assert_eq!(logins(&server), before, "the session carried over");
+
+    // Other providers have no root folder to move.
+    let webdav = Connection::webdav(endpoint("https://dav.example/"), "a", "b");
+    assert_eq!(webdav.with_root_folder(path("x")).err(), Some(CloudError::InvalidConnection));
 }
 
 #[test]

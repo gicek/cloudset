@@ -52,7 +52,8 @@ DSM user needs the File Station application permission.
 
 - **Sign-in** (`synology::sign_in`) sends the DSM user name and password, plus `otp_code` and `enable_device_token=yes`
   when a one-time code is given. Error 403 or 404 becomes `OtpRequired`, 400 `ReauthRequired`, and a disabled account,
-  blocked address or expired password `Forbidden`. The sign-in then checks the root folder exists.
+  blocked address or expired password `Forbidden`. The sign-in then checks the root folder exists; without a root
+  folder, that the shared folders can be listed (`list_share`).
 - **Sessions** go to DSM as `_sid` in the query string; never log query strings. When DSM reports a session expired or
   replaced, or used from another client IP (106, 107, 119, 150), the driver signs in again with the stored password and
   the trusted-device token (`did`, so no one-time code) and replays the request once. The renewed connection comes back
@@ -61,6 +62,11 @@ DSM user needs the File Station application permission.
   the origin changes.
 - **Paths** are `/<root folder>/<path>`, sent as JSON arrays, so names may contain commas. A name with a double quote
   cannot be uploaded (`InvalidPath`).
+- **Without a root folder** (`RemotePath::root()` at sign-in) paths start at the device: listing the root uses
+  `list_share` and returns the shared folders the user can see, and the root's `stat` is a folder without a request.
+  Shared folders are made and removed in DSM's Control Panel, so creating, writing, moving or deleting at that top level
+  reports `Forbidden` before anything is sent. `Connection::with_root_folder` moves the connection to a folder, keeping
+  the session and the trusted-device token.
 - **No version identifier**: entries have no `revision`. Reads look the file up before and after the download; when size
   or modification time changed, they download the newer version (three downloads at most, then `PreconditionFailed`).
   Modification times have whole seconds, so a rewrite of the same size within one second goes unnoticed.

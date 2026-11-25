@@ -515,6 +515,20 @@ impl Connection {
         Ok(self)
     }
 
+    /// Moves a Synology connection to another root folder on the same device, such as one the user picked from a
+    /// listing of a connection without a root folder. The session and the trusted-device token stay, so no new sign-in
+    /// or one-time code is needed. The folder is not checked here: list or stat it first. [`RemotePath::root`] makes
+    /// paths relative to the device itself, whose top level lists the shared folders.
+    ///
+    /// # Errors
+    ///
+    /// [`CloudError::InvalidConnection`] for any other provider.
+    pub fn with_root_folder(mut self, root: RemotePath) -> Result<Self, CloudError> {
+        let Kind::Synology(credential) = &mut self.kind else { return Err(CloudError::InvalidConnection) };
+        credential.root = root;
+        Ok(self)
+    }
+
     /// The QuickConnect ID a Synology connection was resolved from and the region of its control host; resolve it again
     /// when the stored address stops answering (the device moved, or the client left the local network).
     #[must_use]
@@ -547,7 +561,8 @@ impl Connection {
         }
     }
 
-    /// The Synology root folder (`shared folder/path`) that paths are relative to; `None` for everything else.
+    /// The Synology root folder (`shared folder/path`) that paths are relative to, [`RemotePath::root`] for the whole
+    /// device; `None` for everything else.
     #[must_use]
     pub fn root_folder(&self) -> Option<&RemotePath> {
         self.synology_credential().map(|credential| &credential.root)
@@ -728,12 +743,7 @@ impl Connection {
                 let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty()).map(Zeroizing::new);
                 let credential = SynologyCredential {
                     endpoint: parse(stored.endpoint.as_deref().ok_or_else(invalid)?)?,
-                    root: stored
-                        .root
-                        .as_deref()
-                        .and_then(|root| RemotePath::parse(root).ok())
-                        .filter(|root| !root.is_root())
-                        .ok_or_else(invalid)?,
+                    root: stored.root.as_deref().and_then(|root| RemotePath::parse(root).ok()).ok_or_else(invalid)?,
                     username: stored.username.take().filter(|name| !name.is_empty()).ok_or_else(invalid)?,
                     password: Zeroizing::new(stored.password.take().ok_or_else(invalid)?),
                     device_token: non_empty(stored.device_token.take()),
@@ -872,9 +882,12 @@ mod tests {
 
         let base = r#""version":1,"provider":"synology","endpoint":"https://nas.local:5001/","username":"a","password":"b""#;
         assert!(Connection::from_bytes(format!(r#"{{{base},"root":"home"}}"#).as_bytes()).unwrap().quickconnect().is_none());
+        // No root folder: the whole device.
+        let device = Connection::from_bytes(format!(r#"{{{base},"root":""}}"#).as_bytes()).unwrap();
+        assert_eq!(device.root_folder(), Some(&RemotePath::root()));
+        assert_eq!(Connection::from_bytes(&device.to_bytes()).unwrap(), device);
         for bad in [
             format!("{{{base}}}"),
-            format!(r#"{{{base},"root":""}}"#),
             format!(r#"{{{base},"root":"a/../b"}}"#),
             format!(r#"{{{base},"root":"home","quickconnectId":"my-nas"}}"#),
             format!(r#"{{{base},"root":"home","quickconnectId":"my-nas","region":"mars"}}"#),

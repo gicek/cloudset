@@ -1,6 +1,8 @@
 //! File operations through the File Station API (`SYNO.FileStation.*`, DSM 7).
 //!
-//! Paths are relative to the connection's root folder (`/<shared folder>/…` on the device). File Station has no version
+//! Paths are relative to the connection's root folder (`/<shared folder>/…` on the device), or to the device itself when
+//! the connection has no root folder: its top level then lists the shared folders, which File Station cannot create,
+//! change or delete, so such operations report `Forbidden` before anything is sent. File Station has no version
 //! identifier: entries carry no revision, reads check size and modification time before and after the download, and
 //! only `Precondition::None` and `Precondition::Absent` are supported. `Absent` leaves out the upload's `overwrite`
 //! parameter, which makes DSM refuse to replace an existing file (error 1805).
@@ -83,6 +85,16 @@ fn info_result(response: &HttpResponse, path: &RemotePath) -> Result<Option<Entr
     }
 }
 
+/// Whether `path` is the device's top level or a shared folder on a connection without a root folder: File Station can
+/// list these but cannot create, change or delete them.
+fn is_top_level(connection: &Connection, path: &RemotePath) -> bool {
+    connection.synology_credential().is_some_and(|credential| credential.root.is_root()) && path.segments().len() <= 1
+}
+
+fn forbidden<T: Send + 'static>() -> BoxOperation<T> {
+    Box::new(Ready::err(CloudError::Forbidden))
+}
+
 fn steps<S: Steps + 'static>(connection: &Connection, config: &ClientConfig, make: impl FnOnce(Folder) -> S) -> BoxOperation<S::Output> {
     match Folder::of(connection) {
         Ok(folder) => op(make(folder), connection, config),
@@ -110,10 +122,15 @@ impl Steps for Stat {
 }
 
 pub(crate) fn stat(connection: &Connection, config: &ClientConfig, path: RemotePath) -> BoxOperation<Option<Entry>> {
+    // The device's top level has no File Station path; it is always there.
+    if path.is_root() && is_top_level(connection, &path) {
+        return Box::new(Ready::ok(Some(Entry { path, is_dir: true, size: None, modified_at: None, revision: None })));
+    }
     steps(connection, config, |folder| Stat { folder, path })
 }
 
-/// Whether the root folder exists as a folder, for sign-in.
+/// Whether the root folder exists as a folder, for sign-in. Without a root folder, whether the shared folders can be
+/// listed.
 pub(crate) struct RootExists {
     folder: Folder,
 }
@@ -128,10 +145,16 @@ impl Steps for RootExists {
     type Output = bool;
 
     fn first(&mut self) -> Result<Outgoing, CloudError> {
+        if self.folder.root.is_root() {
+            return self.folder.post(LIST, 2, "list_share", [("offset", "0".into()), ("limit", "1".into())]);
+        }
         self.folder.info(&RemotePath::root())
     }
 
     fn next(&mut self, response: HttpResponse) -> Result<Next<bool>, CloudError> {
+        if self.folder.root.is_root() {
+            return Reply::of(&response)?.data().map(|_| Next::Done(true));
+        }
         Ok(Next::Done(info_result(&response, &RemotePath::root())?.is_some_and(|entry| entry.is_dir)))
     }
 }
@@ -141,6 +164,8 @@ impl Steps for RootExists {
 struct List {
     folder: Folder,
     dir: RemotePath,
+    /// The device's top level: the shared folders the user can see (`list_share`).
+    shares: bool,
     entries: Vec<Entry>,
     max_entries: usize,
     /// Entries asked for so far.
@@ -149,6 +174,19 @@ struct List {
 
 impl List {
     fn page(&self) -> Result<Outgoing, CloudError> {
+        if self.shares {
+            return self.folder.post(
+                LIST,
+                2,
+                "list_share",
+                [
+                    ("offset", self.offset.to_string()),
+                    ("limit", PAGE.to_string()),
+                    ("sort_by", "name".into()),
+                    ("additional", r#"["time"]"#.into()),
+                ],
+            );
+        }
         self.folder.post(
             LIST,
             2,
@@ -173,7 +211,8 @@ impl Steps for List {
 
     fn next(&mut self, response: HttpResponse) -> Result<Next<Vec<Entry>>, CloudError> {
         let data = Reply::of(&response)?.data()?;
-        let files = data.get("files").and_then(Value::as_array).ok_or(CloudError::InvalidResponse("files"))?;
+        let key = if self.shares { "shares" } else { "files" };
+        let files = data.get(key).and_then(Value::as_array).ok_or(CloudError::InvalidResponse("files"))?;
         let total = data.get("total").and_then(Value::as_u64).ok_or(CloudError::InvalidResponse("total"))?;
         for item in files {
             let name = item.get("name").and_then(Value::as_str).ok_or(CloudError::InvalidResponse("name"))?;
@@ -196,7 +235,8 @@ impl Steps for List {
 
 pub(crate) fn list(connection: &Connection, config: &ClientConfig, dir: RemotePath) -> BoxOperation<Vec<Entry>> {
     let max_entries = config.limits.max_entries;
-    steps(connection, config, |folder| List { folder, dir, entries: Vec::new(), max_entries, offset: 0 })
+    let shares = dir.is_root() && is_top_level(connection, &dir);
+    steps(connection, config, |folder| List { folder, dir, shares, entries: Vec::new(), max_entries, offset: 0 })
 }
 
 // MARK: - Reading
@@ -397,6 +437,9 @@ pub(crate) fn write(
     if !supports_write_precondition(&precondition) {
         return Box::new(Ready::err(CloudError::UnsupportedPrecondition));
     }
+    if is_top_level(connection, &path) {
+        return forbidden();
+    }
     let data = Zeroizing::new(data);
     steps(connection, config, |folder| Write { folder, path, data, precondition, uploaded: false })
 }
@@ -447,6 +490,9 @@ pub(crate) fn create_dir(connection: &Connection, config: &ClientConfig, path: R
     if path.is_root() {
         return Box::new(Ready::ok(()));
     }
+    if is_top_level(connection, &path) {
+        return forbidden();
+    }
     steps(connection, config, |folder| CreateDir { folder, path, failed: None })
 }
 
@@ -477,6 +523,9 @@ impl Steps for Delete {
 }
 
 pub(crate) fn delete(connection: &Connection, config: &ClientConfig, path: RemotePath) -> BoxOperation<()> {
+    if is_top_level(connection, &path) {
+        return forbidden();
+    }
     steps(connection, config, |folder| Delete { folder, path })
 }
 
@@ -649,6 +698,9 @@ impl Steps for Rename {
 }
 
 pub(crate) fn rename(connection: &Connection, config: &ClientConfig, from: RemotePath, to: RemotePath) -> BoxOperation<Entry> {
+    if is_top_level(connection, &from) || is_top_level(connection, &to) {
+        return forbidden();
+    }
     steps(connection, config, |folder| Rename { folder, from, to, from_is_dir: false, state: RenameState::Source })
 }
 

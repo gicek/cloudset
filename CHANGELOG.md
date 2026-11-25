@@ -4,6 +4,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-25
+
+Lets Synology users pick or create a folder after signing in, instead of naming one first.
+
+### Added
+
+- Synology without a root folder: `synology::sign_in` accepts `RemotePath::root()`, whose listing returns the shared
+  folders (`list_share`), so users can pick or create a folder after signing in. Creating, writing, moving or deleting
+  at the device's top level reports `Forbidden` before anything is sent.
+- `Connection::with_root_folder` moves a Synology connection to another folder on the same device, keeping the session
+  and the trusted-device token, so no second one-time code is needed.
+- Testing: `MemorySynology` answers `list_share` and refuses new shared folders.
+
+### Changed
+
+- `synology::sign_in` with an empty root no longer reports `InvalidPath`, and a stored Synology connection with an empty
+  root is now valid.
+
 ## [0.4.0] - 2026-11-24
 
 Adds Synology DSM 7 as a provider, reached directly or through QuickConnect, including devices and users in mainland
@@ -213,7 +231,8 @@ This release changes the public API; see "Changed" for the migration.
 - Nextcloud: Login Flow v2 (`begin_login` / `poll_login`, looking up the user ID for the WebDAV address) and revocation of
   the app password.
 
-[Unreleased]: https://github.com/gicek/cloudset/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/gicek/cloudset/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/gicek/cloudset/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/gicek/cloudset/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gicek/cloudset/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gicek/cloudset/releases/tag/v0.2.0
